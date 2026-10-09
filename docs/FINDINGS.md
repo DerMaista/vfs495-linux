@@ -409,6 +409,20 @@ SSL re-test with a USB trace of HP's own run (runtime/usblog.c, no gdb -> real t
   every record MAC ok, and an encrypted GetVersion (AppData record `17 03 00 ..` holding `01`) is answered
   with a valid encrypted 38 B reply (patch bits set, as after HP's init).
 
+Session lifecycle (verified 2026-10-09):
+- Close = encrypted alert record (type 0x15) with plaintext `01 00` (close_notify), exactly what HP sends
+  on a normal exit; the sensor answers with its own encrypted `01 00`. tools/ssl_session.py close_session().
+- After a clean close the sensor keeps the firmware patches loaded (GetVersion byte 17 != 0). Like HP, send
+  1a UnloadPatch before re-uploading them; then a new session opens immediately (back-to-back runs, no reset).
+- Without a close (process killed / crashed) the sensor keeps the session: the next plaintext command gets an
+  encrypted alert and the sensor resets itself (re-enumerates, new USB address, can take >3 s). If it hangs
+  instead (writes time out), a logical unplug clears it: echo 0 > /sys/bus/usb/devices/<port>/authorized,
+  then 1. No power-off needed for this case.
+- Replies can be longer than 1 KiB (some 02 commands return ~2.4 KiB): read up to 16 KiB; the sensor ends a
+  reply with a short packet. A truncated read leaves the sensor hung.
+- The finger stream on ep 0x82 during a swipe (after 17 reports finger) is ENCRYPTED (flat byte histogram),
+  not with the session keys in any plain AES mode; calibration scans are plaintext. Open: find the key.
+
 ssl_session.py bugs found (not the cause of 0x2f): (1) the 1f flash reads request 16384 B, but the sensor
 sends exactly 128 / 4096 B in full 64 B packets with no short packet, so each read times out (400 ms) and
 the data is lost; read exactly 128 / 4096 like HP. (2) Commands go out back-to-back; without HP's ~12 ms

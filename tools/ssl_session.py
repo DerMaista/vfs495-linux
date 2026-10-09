@@ -180,6 +180,11 @@ def init_sensor(dev, init):
         r = recv(dev)
         if r[:1] == b"\x15":
             raise StaleSession()
+        if c == b"\x01" and len(r) > 17 and r[17] and not flash:
+            # patches still loaded (e.g. after a clean close): unload first, like HP does
+            time.sleep(INIT_PAUSE)
+            send(dev, b"\x1a")
+            recv(dev)
         if c[0] == 0x1F:                       # SPI flash read: data follows on ep 0x82
             size = struct.unpack_from("<I", c, 5)[0]
             # read exactly `size`: the sensor sends full 64 B packets and no short packet
@@ -231,16 +236,33 @@ def handshake(dev, modulus):
     return st
 
 
-def command(dev, st, payload, reply=0x400, to=3000):
+def command(dev, st, payload, reply=0x4000, to=3000):
     """Send one VCSFW command inside the session (AppData record); return the decrypted reply."""
     send(dev, st.encrypt_record(0x17, payload), to)
     out = b""
     for typ, body in split_records(recv(dev, reply, to)):
+        if typ == 0x15 and len(body) % 16:            # plaintext alert: the sensor dropped the session
+            raise RuntimeError("sensor alert " + body.hex())
         data, ok = st.decrypt_record(typ, body)
         if not ok:
             raise RuntimeError("bad MAC on reply")
         out += data
     return out
+
+
+def close_session(dev, st):
+    """End the session like HP does on exit: encrypted close_notify alert (01 00), the sensor answers
+    with its own. Without this the sensor keeps the session after we exit and rejects the next client
+    (it then resets itself, which costs a re-enumeration). Returns True if the sensor confirmed."""
+    try:
+        send(dev, st.encrypt_record(0x15, b"\x01\x00"))
+        for typ, body in split_records(recv(dev, 0x400, 1000)):
+            if typ == 0x15 and len(body) % 16 == 0:
+                data, ok = st.decrypt_record(typ, body)
+                return ok and data == b"\x01\x00"
+    except usb.core.USBError:
+        pass
+    return False
 
 
 def open_session(init, attempts=2):
@@ -254,11 +276,18 @@ def open_session(init, attempts=2):
                 raise RuntimeError("RSA key (storage id 10) not found in sensor flash")
             return dev, handshake(dev, modulus)
         except (StaleSession, usb.core.USBError):
+            old = dev.address
             close_device(dev)
             if attempt == attempts - 1:
                 raise
             print("sensor still held an old session and reset itself; retrying", file=sys.stderr)
-            time.sleep(3)                             # wait for it to re-enumerate
+            deadline = time.monotonic() + 10          # wait until it re-enumerates (new address)
+            while time.monotonic() < deadline:
+                new = usb.core.find(idVendor=VID, idProduct=PID)
+                if new is not None and new.address != old:
+                    break
+                time.sleep(0.2)
+            time.sleep(0.5)
         except Exception:
             close_device(dev)
             raise
@@ -271,6 +300,7 @@ def main():
         print("session open: handshake OK, sensor Finished verified")
         print("GetVersion (encrypted):", command(dev, st, b"\x01").hex())
     finally:
+        print("session closed:", "sensor confirmed" if close_session(dev, st) else "NOT confirmed")
         json.dump(TRAFFIC, open(CAP + "/my_session.json", "w"))
         close_device(dev)
 
