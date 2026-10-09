@@ -474,3 +474,20 @@ TAKEAWAY for a native reimpl: the fix for inconsistent height is a FIXED pixels-
 NOT frequency-domain rescaling (tried twice, fails on anisotropic real prints). tools/vfs495_assemble.py
 (scratch prototype) had the right shape (fixed rate `d` from the aux lag, ~24 mean self-score) but a noisy
 lag estimate; porting HP's median+stiction cleanup of the lag is the missing piece.
+
+## Static patch extraction is a dead end (2026-10-10) — one-time HP run stays necessary for setup
+Goal was to build captures/init_cmds.json + capture_cmds.json from HP's downloaded package files WITHOUT
+running HP's binary, so the native path needs no HP execution at all. Result: not feasible, low value.
+- init patch #1 (693 B) IS stored verbatim in validity-sensor (@0x172080) — copyable.
+- The other patches (1301/2581/405 B and the 02 capture-config blobs) are stored in the binary too, but the
+  uploaded form differs: HP replaces a leading 4 B header + 256 B RSA signature with a 32 B authenticator
+  (scsReplaseRSASignatureByHMAC @0x516f60), AND the body bytes differ from the stored body (stored_body !=
+  sent body) -> the patch is re-keyed/encrypted per sensor at runtime, not merely re-signed.
+- The 32 B authenticator uses K = SHA256(storage id 10 key = the 256 B RSA modulus from sensor flash), then
+  a chain of 32->32 B SHA calls with per-block counters (12 palCryptoDigest calls per sign). It is NOT a
+  plain HMAC-SHA over the body (all standard constructions tried, none match). This is HP's firmware-patch
+  protection tied to the sensor key.
+- Conclusion: reproducing the uploaded patches = reimplementing HP's patch encrypt/authenticate scheme, for
+  the sole benefit of skipping ONE HP run at setup. Not worth it, and it is the sensor's protection
+  mechanism. Keep the community approach: user downloads HP's package, runtime/trace_to_init.py captures the
+  init+setup blobs from ONE traced HP run; after that HP never runs again (native session/capture/decrypt).
