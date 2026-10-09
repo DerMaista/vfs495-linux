@@ -359,6 +359,61 @@ reboot if stuck, password fallback always works.
 - To use: `sudo -k && sudo true` then swipe; or lock screen / login. Password always works as fallback.
 - Undo: pam-auth-update (untick fprintd); systemctl disable --now vfs495-bridge; rm the drop-in + unit.
 
+## Sensor events + SSL re-test on a second machine (2026-10-09, HP laptop, NixOS)
+Sensor events (idsSensorEventPerformCallback @0x459bf0, event id in esi), timeline of one getprintwait:
+- 0xcc ~1.6 s after start = wake-on-event armed; then NOTHING runs while idle (no scan lines stream).
+- 0xd0 = finger detected (the swipe starts) -> lines stream, IRprocessScanline etc.
+- 0xcd = finger gone / swipe done, 0xd2 = capture finished.
+UnpackLineRT is NOT a finger signal: it fires 3x at ~1.5 s during init (calibration lines), no finger.
+The bridge now uses 0xd0 to report finger-on to fprintd (harvest_assembled.py, VFS_FINGER_SOCK).
+The ~2 s "arm" delay per capture = gdb/process start + patches + SPI reads + SSL handshake + calibration
+(armed at 1.63 s after `run`); paid on every capture because the session is not reused.
+
+SSL re-test with a USB trace of HP's own run (runtime/usblog.c, no gdb -> real timing):
+- HP's ServerHello -> flight gap is 4.7 ms; the sensor then needs ~260 ms (its RSA decrypt) before
+  answering CCS+Finished. tools/ssl_session.py: 3.7 ms gap, and the alert 0x2f also comes ~256 ms after
+  the flight -> the sensor decrypts our CKE and fails at the Finished check. TIMING RULED OUT.
+- HP adapts init to the sensor state: if GetVersion shows a patch still loaded (previous run), it sends
+  1a UnloadPatch first and the first 06 patch reply is 0000 + 32 extra bytes; on a clean sensor it skips
+  1a and the reply is plain 0000. HP's handshake succeeds from the clean state too, so neither matters.
+- Exact replay of HP's clean-state run (same commands, same replies, same inter-command pauses incl.
+  12 ms before the 2nd 1f and 23 ms before the 1301 B patch) still -> 0x2f. Wire + timing identical.
+- The 693 B and 1301 B patches are byte-identical across runs (static, no per-session data) and have
+  entropy 7.7-7.9 bit/byte -> uploaded encrypted; the sensor-side SSL code is not readable from them.
+  (Answers open question 1: the patch reaches the sensor encrypted.)
+- After a fatal alert the sensor resets itself (USB re-enumerates); harmless, comes back clean.
+- NEW: the sensor KEEPS HP's SSL session after HP's process is killed: a plaintext 01 sent afterwards is
+  answered with an ENCRYPTED alert record (15 03 00 00 20 + 32 B), then the sensor resets. This is why
+  "priming with the tool first" never helped, and it allows a session-takeover path: let HP handshake
+  once, dump its key block / IVs / sequence numbers via gdb, continue the session from our own code.
+*** SSL HANDSHAKE SOLVED (2026-10-09): 0x2f was the WRONG RSA KEY ***
+- Differential test: one HP handshake under gdb (premaster, EM incl. PKCS#1 padding, randoms, master,
+  keyblock, every handshake-hash update) + its real flight from the USB log; rebuilt the flight offline
+  with ssl_session.py from HP's own inputs. Everything matched byte-exact (master, keyblock, 368 B hash
+  input, CCS, 69 B encrypted Finished) EXCEPT the RSA ciphertext.
+- HP sets up TWO RSA-2048 keys per session at 0x51fac0 (bits=rdi, exp=rsi, modulus=rdx). The FIRST one
+  (what runtime/dump_rsakey.py dumps: it stops at the first hit) is NOT used for the key exchange
+  (probably the root key that validates the sensor certificate). The SECOND one is the session key:
+  with it, pow(EM_be, 65537, n_le) == wire ciphertext exactly (modulus little-endian, EM and output
+  big-endian, as documented). The second key is per-device but stable across sessions and sensor resets.
+- With the second key, ssl_session.py completes the handshake: the sensor answers CCS + Finished
+  (+ an AppData record 17 03 00 00 40 ...). No HP binary in the loop. The earlier "content-independent
+  0x2f" was the sensor decrypting garbage with every CKE we sent.
+- The session key does not need HP or a dump: it is storage id 10 in the 4 KiB flash block that init
+  already reads (1f05 -> ep 0x82; block = flash 0x1000..0x1fff). Layout: 'EAT"' header, then from byte 13
+  entries `ff <id> <u32 addr LE> <u32 size LE>`; id 10 = addr 0x16b6, size 0x100 (ids 7,8,11-15 also there).
+- Sensor Finished quirk: label 'SRVR' (LE int 0x53525652) over the SAME handshake msgs as the client
+  Finished (ClientHello + ServerHello/Done + CKE). The client Finished is NOT hashed in (standard SSLv3
+  would include it).
+- Verified end-to-end from our own client (no HP code running): handshake OK, sensor Finished VERIFIED,
+  every record MAC ok, and an encrypted GetVersion (AppData record `17 03 00 ..` holding `01`) is answered
+  with a valid encrypted 38 B reply (patch bits set, as after HP's init).
+
+ssl_session.py bugs found (not the cause of 0x2f): (1) the 1f flash reads request 16384 B, but the sensor
+sends exactly 128 / 4096 B in full 64 B packets with no short packet, so each read times out (400 ms) and
+the data is lost; read exactly 128 / 4096 like HP. (2) Commands go out back-to-back; without HP's ~12 ms
+pause before the second 1f the sensor reset during init.
+
 ## NEXT SESSION START HERE
 
 ## NEXT SESSION START HERE
