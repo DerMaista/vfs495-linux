@@ -421,7 +421,17 @@ Session lifecycle (verified 2026-10-09):
 - Replies can be longer than 1 KiB (some 02 commands return ~2.4 KiB): read up to 16 KiB; the sensor ends a
   reply with a short packet. A truncated read leaves the sensor hung.
 - The finger stream on ep 0x82 during a swipe (after 17 reports finger) is ENCRYPTED (flat byte histogram),
-  not with the session keys in any plain AES mode; calibration scans are plaintext. Open: find the key.
+  separately from the SSL session. SOLVED (2026-10-09): the HOST picks the image key. The arming command
+  (02, 3033 B = the last setup command) carries a 32-byte AES-256 key at offset 0x6ef (2927) and a 16-byte
+  IV at 0x70f (2959); the command itself travels inside the SSL session. The sensor encrypts the whole swipe
+  as ONE AES-256-CBC stream with that key/IV (verified: matches HP's palAesCBCDecrypt output byte-exact, and
+  CBC-decrypting our own swipe with the key we sent yields clean 01fe frames). Decrypted stream = N frames of
+  272 B: 8 B header (01 fe xx 00 07 07 ..) + 264 pixels. HP decrypts a whole ~84096 B decoder buffer at once.
+- FULL CAPTURE WITHOUT HP (2026-10-09): our own client ran init + handshake + the 24 setup/calibration
+  commands + finger poll + read the encrypted swipe + decrypt (host key) + descramble (driver table) +
+  reconstruct.py -> a recognizable fingerprint (loop core, ridge flow). Remaining: use a FRESH random image
+  key instead of replaying HP's; detect swipe end by line energy instead of a fixed read window; better image
+  assembly (reconstruct.py is weaker than HP's motion-compensated IRreconstructImage).
 
 ssl_session.py bugs found (not the cause of 0x2f): (1) the 1f flash reads request 16384 B, but the sensor
 sends exactly 128 / 4096 B in full 64 B packets with no short packet, so each read times out (400 ms) and
