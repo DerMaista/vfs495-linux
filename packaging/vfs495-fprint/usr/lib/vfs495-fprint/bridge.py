@@ -10,7 +10,7 @@ from gi.repository import GLib
 
 SOCK = os.environ.get("FP_VIRTUAL_IMAGE", "/run/fprint/virtimg_sock")
 CAPTURE = "/usr/lib/vfs495-fprint/capture.py"
-MIN_ROWS = 80                                # a real swipe assembles to ~200x300; tiny = no usable print
+MIN_ROWS = int(os.environ.get("VFS_MIN_ROWS", "80"))  # a real swipe assembles to ~200x300; tiny = no usable print
 RUN = "/run/vfs495-fprint"                  # tmpfs, root only; last.pgm = most recent capture (debugging)
 BUS_NAME, DEV_IFACE = "net.reactivated.Fprint", "net.reactivated.Fprint.Device"
 PROPS = "org.freedesktop.DBus.Properties"

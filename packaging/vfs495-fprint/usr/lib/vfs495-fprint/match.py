@@ -17,7 +17,7 @@ different fingers < 15. No sensor is touched unless --capture is used.
 import os, sys, re, glob, socket, struct, subprocess, tempfile, threading, time
 
 THRESHOLD = 40
-MIN_ROWS = 80
+MIN_ROWS = int(os.environ.get("VFS_MIN_ROWS", "80"))  # scans shorter than this are rejected, as in bridge.py
 CAPTURE = "/usr/lib/vfs495-fprint/capture.py"
 
 # --- must happen before libfprint is loaded: private socket + score debug output ---
