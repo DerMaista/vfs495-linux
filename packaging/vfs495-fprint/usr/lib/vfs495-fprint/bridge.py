@@ -28,9 +28,15 @@ def deliver(w, h, data):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(SOCK)
     s.sendall(struct.pack("<ii", w, h) + data); s.close()
 
+def finger_off():
+    """Clear finger-present after an attempt without an image (harvest_assembled.py reported it on
+    at swipe start). virtual_image ignores it when no capture is running."""
+    try: deliver(-4, 0, b"")
+    except OSError: pass
+
 def run_capture(out):
     """One capture attempt. Returns True if an image was written to `out`."""
-    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": "70"},
+    p = subprocess.Popen([sys.executable, CAPTURE, out], env={**os.environ, "VFS_TIMEOUT": "70", "VFS_FINGER_SOCK": SOCK},
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     with lock: state["proc"] = p
     rc = p.wait()
@@ -52,7 +58,7 @@ def capture_and_deliver(gen):
         for attempt in range(2):                       # a swipe can straddle the window; try twice
             ok = run_capture(out)
             if state["gen"] != gen or not state["wanted"]:
-                log("capture cancelled (fprintd no longer waiting)"); return
+                log("capture cancelled (fprintd no longer waiting)"); finger_off(); return
             if ok:
                 img = read_pgm(out); os.replace(out, last)
                 if img[1] < MIN_ROWS:
@@ -63,7 +69,8 @@ def capture_and_deliver(gen):
                         deliver(*img); log(f"delivered scan {img[0]}x{img[1]} after {time.monotonic()-t0:.1f}s"); return
                     except OSError as e:
                         log(f"deliver failed: {e}"); return
-            if not ok: log("no usable finger scan" + (", retrying" if attempt == 0 else " (give up)"))
+            if not ok:
+                finger_off(); log("no usable finger scan" + (", retrying" if attempt == 0 else " (give up)"))
     finally:
         try: os.unlink(out)
         except OSError: pass
