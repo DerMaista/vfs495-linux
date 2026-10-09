@@ -429,8 +429,9 @@ Session lifecycle (verified 2026-10-09):
   272 B: 8 B header (01 fe xx 00 07 07 ..) + 264 pixels. HP decrypts a whole ~84096 B decoder buffer at once.
 - FULL CAPTURE WITHOUT HP (2026-10-09): our own client ran init + handshake + the 24 setup/calibration
   commands + finger poll + read the encrypted swipe + decrypt (host key) + descramble (driver table) +
-  reconstruct.py -> a recognizable fingerprint (loop core, ridge flow). Remaining: use a FRESH random image
-  key instead of replaying HP's; detect swipe end by line energy instead of a fixed read window; better image
+  reconstruct.py -> a recognizable fingerprint (loop core, ridge flow). A FRESH random key/IV from our own
+  client (secrets.token_bytes, patched into the arming command) works: the swipe decrypts into clean frames,
+  so the sensor does not check or derive the key. Remaining: detect swipe end by line energy instead of a fixed read window; better image
   assembly (reconstruct.py is weaker than HP's motion-compensated IRreconstructImage).
 
 ssl_session.py bugs found (not the cause of 0x2f): (1) the 1f flash reads request 16384 B, but the sensor
