@@ -451,3 +451,26 @@ Feasibility is PROVEN: end-to-end plaintext fingerprint capture works on Debian 
 1. Is the .img decrypted on host (key in binary) before upload, or uploaded encrypted?
 2. Is the capture data path (irDliGetImage) AES-secured on VFS495, or only matching/auth patches?
 3. Minimal command sequence: device init -> patch upload? -> calibration -> capture.
+
+## HP image assembly: how vertical height works (2026-10-10, static analysis of IRreconstructImage)
+The VFS495 is a swipe sensor; output height depends on finger speed. HP's assembly (no in-process reuse
+is possible: validity-sensor is ET_EXEC, not a PIE, so it cannot be dlopen'd, and IRreconstructImage
+references ~7 globals + stateful circular buffers set up during capture). The ALGORITHM, from the binary:
+- A second short sensor row (decrypted frame columns 200..263, "aux") sits ~4.3 px from the main row and
+  lines up with main columns ~70..133. Each ridge crosses aux `lag` lines before main, so finger speed =
+  D_ROWS / lag px per scan line. HP estimates lag per line during capture (IRcorrelate / IRcorrelateUp /
+  IRcorrelateDown for swipe direction).
+- IRfinalizeYlagEstimates cleans the per-line lag BEFORE reconstruction: interpolateYlags (gap fill),
+  detectStictionZone (finger paused -> no travel), detectNoiseBeforeBase (ignore pre-contact noise),
+  opt_med5 (5-point median). This is the stabilization our prototypes lacked.
+- IRreconstructImage accumulates displacement and emits output rows at a FIXED displacement->row rate
+  (fixed divisor, not adaptive), each row built by IRinterpolateLine (linear interp between adjacent input
+  lines), and CAPS the output at 300 rows (loop guard `cmp [rsp+0x94],0x12c; ja` = 300; a short swipe
+  gives fewer, e.g. the 267-row capture). Also: IRfinalizeXlagEstimates + IRapplyXLagOffset correct
+  sideways drift; IRSkewCorrectImage corrects skew; IRConstrastEnhanceImageRows/Cols; IRhandleInvertAndFlip
+  mirrors (HP's output is L-R mirrored vs our raw column order).
+TAKEAWAY for a native reimpl: the fix for inconsistent height is a FIXED pixels-per-displacement rate
+(from the aux-row lag) + a 300-row cap, NOT reconstruct.py's adaptive out_rows (which gave 200..1200) and
+NOT frequency-domain rescaling (tried twice, fails on anisotropic real prints). tools/vfs495_assemble.py
+(scratch prototype) had the right shape (fixed rate `d` from the aux lag, ~24 mean self-score) but a noisy
+lag estimate; porting HP's median+stiction cleanup of the lag is the missing piece.
