@@ -536,3 +536,30 @@ ignored, and the image starts at the first moving line. 6 new live swipes (2 wit
 all six give clean prints; one-to-one scores mean 39.4, 7/15 >= 40 (best 73), the two rest-first swipes
 score like the others. (The stiction step was tuned on live data only; the offline HP comparison above was
 done before it, with those recordings already deleted.)
+
+## What the per-device setup data actually is (2026-10-10) — corrects the "static patch extraction" note above
+Classified the 8 init + 24 setup commands by opcode, and diffed two independent HP runs on the same sensor
+(scratch hp_plain_run1/2.json, decrypted). The earlier note's "patches re-keyed/encrypted per run" was wrong:
+the firmware patches are STABLE per sensor (byte-identical across runs); only tiny nonce fields in the config
+vary. Breakdown of the setup stream:
+
+- **`06` DownloadPatch — HP's firmware, the only irreducibly-proprietary part.** 4 distinct patches total
+  (693 B init; 1301 B init+setup; 405 B setup x3; 2581 B setup), ~5 KB distinct. Byte-identical run-to-run on
+  this sensor. They differ from the copies stored in validity-sensor (re-keyed/authenticated for this sensor
+  via scsReplaseRSASignatureByHMAC + a SHA chain over storage-id-10 key), so they can't be lifted from HP's
+  package, only captured from the running sensor. This is firmware code-signing/DRM tied to the device key;
+  reproducing the transform (stored patch -> uploaded patch) = forging firmware auth, which we do NOT do. It
+  is also moot: the sensor needs HP's firmware to work at all, like any linux-firmware blob.
+- **`02` config — structured parameters, NOT signed, NOT opaque.** 12 commands, 31.6 KB, but ~97-99 % CONSTANT
+  run-to-run. Only small embedded fields change: 1 byte ([11][12][13][14]), a 64 B block ([4] @2225, [18][23]
+  @2585), and the arming command ([23*]/3033 B) whose 32 B key @2927 + 16 B IV @2959 the HOST chooses anyway.
+  These are config/calibration tables the sensor accepts on replay (the native path replays them verbatim and
+  works). Understandable protocol, not a secret — could be synthesized, but see below.
+- **`1a` UnloadPatch (x5), `1f` SPI flash read (x1), `12` (x1), `17` GetFingerState poll** — trivial fixed cmds.
+
+**Bottom line for "no proprietary blobs":** the irreducible proprietary core is the 4 firmware patches (~5 KB),
+and there is no way around shipping/uploading HP's firmware — that firmware IS what runs the sensor, and it is
+authenticated to the device. Synthesizing the `02` config ourselves would remove ~31 KB of captured data but
+still leave the `06` patches, so it is a lot of work for a cosmetic win. The practical minimal-proprietary
+setup already stands: capture the patches + config once from the user's own sensor, replay forever, never run
+HP again. Analogous to needing linux-firmware for wifi/GPU. (vfs495_native_capture.py / the libfprint driver.)
