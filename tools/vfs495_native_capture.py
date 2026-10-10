@@ -5,6 +5,7 @@ Status: capture + decryption work; the image assembly (vfs495_assemble.py, model
 HP's own images offline (score ~50 vs HP's 78 HP-to-HP) but is not yet validated live. Not used by the bridge.
 
     sudo python3 vfs495_native_capture.py OUT.pgm        env: VFS_TIMEOUT (s to wait for a finger, default 60)
+                                                          VFS495_CAPTURES=DIR with init_cmds.json + capture_cmds.json
                                                           VFS_RAW=FILE.npy also saves the raw scan lines (biometric data!)
 
 Pipeline: secure session (ssl_session.py) -> setup/calibration commands -> arming command with a fresh
@@ -21,6 +22,9 @@ import json
 import os
 import re
 import secrets
+import signal
+import socket
+import struct
 import sys
 import time
 
@@ -33,7 +37,7 @@ sys.path.insert(0, HERE)
 import vfs495_assemble  # noqa: E402
 import ssl_session as S  # noqa: E402
 
-CAP = HERE + "/../captures"
+CAP = os.environ.get("VFS495_CAPTURES", HERE + "/../captures")
 KEY_OFF, IV_OFF, ARM_LEN = 2927, 2959, 3033   # image key/IV inside the arming command (02, 3033 B)
 FRAME, HDR, WIDTH, MAIN = 272, 8, 264, 200    # decrypted frame: 8 B header + 264 pixels; cols 0..199 = print
 READ_TIMEOUT_MS = 150      # the sensor ends the stream on its own; a read timeout = swipe over
@@ -127,7 +131,25 @@ def to_image(raw, perm):
     return vfs495_assemble.assemble(img)
 
 
+def report_finger_on():
+    """Tell libfprint's virtual_image (VFS_FINGER_SOCK, set by the bridge) the finger is on, as (-4, 1),
+    so fprintd's finger-present goes true at swipe start (same as HP's harvest_assembled.py)."""
+    sock = os.environ.get("VFS_FINGER_SOCK")
+    if not sock:
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(sock)
+        s.sendall(struct.pack("<ii", -4, 1))
+        s.close()
+    except OSError:
+        pass
+
+
 def main():
+    # the bridge cancels a capture with SIGTERM: unwind through the finally blocks so the sensor
+    # session is closed (close_notify) instead of being left open
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if len(sys.argv) < 2:
         sys.exit("usage: vfs495_native_capture.py OUT.pgm")
     out = sys.argv[1]
@@ -142,6 +164,7 @@ def main():
         if not wait_finger(dev, st, float(os.environ.get("VFS_TIMEOUT", "60"))):
             print("no finger captured", file=sys.stderr)
             return 10
+        report_finger_on()
         raw = read_swipe(dev, key, iv, perm)
         stop_stream(dev, st)
     finally:

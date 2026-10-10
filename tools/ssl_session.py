@@ -25,7 +25,7 @@ import usb.util
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CAP = HERE + "/../captures"
+CAP = os.environ.get("VFS495_CAPTURES", HERE + "/../captures")
 VID, PID = 0x138A, 0x003F
 EP_OUT, EP_CMD_IN, EP_DATA_IN = 0x01, 0x81, 0x82
 INIT_PAUSE = 0.03   # HP pauses up to ~30 ms between init commands; back-to-back the sensor resets
