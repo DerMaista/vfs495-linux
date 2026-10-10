@@ -6,11 +6,9 @@
  * This library is free software; you can redistribute it and/or modify it under
  * the terms of the GNU Lesser General Public License, version 2.1 or later.
  *
- * STATUS: scaffold. The device lifecycle, DLI line decode + column descramble,
- * and swipe assembly are implemented from the reverse-engineered protocol. The
- * sensor unlock (RAM patch upload + SSLv3 control session) is stubbed with the
- * decoded steps as TODOs -- see vfs495-re/NOTES.md ("REMAINING TO A DRIVER").
- * Modeled on the vfs5011/vfs301 sibling drivers.
+ * STATUS (see PLAN.md): open/close run the sensor's init sequence and SSLv3 session (port of
+ * tools/ssl_session.py, verified byte-exact offline by tests/test_ssl.sh). Capture (phase 4) and
+ * assembly (phase 5) are still placeholders. Modeled on the vfs5011/vfs301 sibling drivers.
  */
 
 #define FP_COMPONENT "vfs495"
@@ -18,12 +16,21 @@
 #include "drivers_api.h"
 #include "vfs495_proto.h"
 #include "vfs495_setup.h"
+#include "vfs495_ssl.h"
+
+#include <openssl/rand.h>
 
 struct _FpDeviceVfs495
 {
   FpImageDevice parent;
 
   Vfs495Setup  *setup;            /* init/setup commands (VFS495_SETUP_PATH) */
+  Vfs495Ssl     ssl;
+  Vfs495Handshake hs;
+  gboolean      session_open;
+  guint         init_idx;         /* next init command */
+  GBytes       *flash;            /* the 4 KiB flash block (storage table) */
+  GByteArray   *reply;            /* last reply read by recv () */
 
   guint8       *capture_buf;      /* raw ep2 DLI bytes                 */
   gsize         capture_len;
@@ -102,8 +109,7 @@ static struct fpi_line_asmbl_ctx assembling_ctx = {
  * Capture SSM
  * ------------------------------------------------------------------------- */
 enum activate_states {
-  ACTIVATE_UPLOAD_PATCH,   /* cmd 0x06 x2 (getprint + security patches)      */
-  ACTIVATE_OPEN_SESSION,   /* SSLv3 handshake over cmd tunnel (0x11)         */
+  ACTIVATE_START,
   ACTIVATE_AWAIT_FINGER,   /* poll finger state / interrupt ep 0x83          */
   ACTIVATE_CAPTURE,        /* read DLI stream from ep 0x82                   */
   ACTIVATE_PROCESS,        /* decode + descramble + assemble                 */
@@ -169,33 +175,9 @@ activate_run_state (FpiSsm *ssm, FpDevice *_dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case ACTIVATE_UPLOAD_PATCH:
-      /* Sensor unlock, step 1: load the firmware "patches" into sensor RAM.
-       * Sequence (from BEST-swipe-getprintwait.usb.log, all plaintext, pre-SSL):
-       *   GetVersion(01), GetStartInfo(19), DownloadPatch(06, getprint patch),
-       *   GetVersion(01), SPI flash id read(1f), SPI flash read(1f),
-       *   DownloadPatch(06, security-mgmt patch), GetVersion(01).
-       * Each DownloadPatch is [0x06][patch bytes]; sensor replies u16 status 0.
-       * The patch blobs are HP's proprietary firmware -- NOT embedded here.
-       * vfs495_load_patches() must read them from HP's SoftPaq (sp84530,
-       * HPUsbVFS495 image / captured blobs) supplied by the user at runtime.
-       * See vfs495_proto.h and driver/README.md. */
-      /* TODO: implement vfs495_send(dev, {0x01}); ... ; vfs495_send_patch(dev, blob, len);
-       * using fpi_usb_transfer on EP_CMD_OUT/IN. */
+    case ACTIVATE_START:
+      /* the session is already open (dev_open); phase 4: setup commands with a fresh image key */
       fpi_image_device_activate_complete (dev, NULL);
-      fpi_ssm_next_state (ssm);
-      break;
-
-    case ACTIVATE_OPEN_SESSION:
-      /* Sensor unlock, step 2: the mandatory SSLv3 session (capture cmd 0x02 is
-       * refused 0x0404 without it -- verified). Fully specified in
-       * driver/SSL_PROTOCOL.md: ClientHello (suites 0044/0043/0042) -> ServerHello,
-       * fetch sensor RSA-2048 pubkey via scsGetDataFromStorage(id 10), RSA-encrypt
-       * a 48-byte premaster -> ClientKeyExchange, SSLv3 MD5/SHA1 master + key block
-       * -> AES-256-CBC keys, CCS + Finished. AppData (17 03 00 ...) wraps the VCSFW
-       * capture command; the image itself stays plaintext on EP_DATA_IN.
-       * TODO: implement in vfs495_ssl.c using NSS (RSA/MD5/SHA1/AES) which libfprint
-       * already links. Reference vectors: captures/ssl_secrets.json. */
       fpi_ssm_next_state (ssm);
       break;
 
@@ -236,8 +218,288 @@ activate_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
 }
 
 /* ---------------------------------------------------------------------------
- * Device lifecycle
+ * USB helpers: every exchange is one SSM state that sends, one that reads into
+ * self->reply, then a state that looks at the reply.
  * ------------------------------------------------------------------------- */
+#define CMD_TIMEOUT   3000
+#define INIT_PAUSE    30      /* ms between init commands: back to back, the sensor resets */
+#define REPLY_SMALL   0x400   /* init + handshake replies */
+#define REPLY_LARGE   0x4000  /* encrypted command replies (the sensor ends them with a short packet) */
+
+static void
+send_buf (FpiSsm *ssm, FpDevice *dev, const guint8 *data, gsize len)
+{
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+
+  t->ssm = ssm;
+  t->short_is_error = TRUE;
+  fpi_usb_transfer_fill_bulk_full (t, VFS495_EP_CMD_OUT, g_memdup2 (data, len), len, g_free);
+  fpi_usb_transfer_submit (t, CMD_TIMEOUT, NULL, fpi_ssm_usb_transfer_cb, NULL);
+}
+
+static void
+send_array (FpiSsm *ssm, FpDevice *dev, GByteArray *data)
+{
+  send_buf (ssm, dev, data->data, data->len);
+  g_byte_array_unref (data);
+}
+
+static void
+recv_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (t->ssm, error);
+      return;
+    }
+  g_clear_pointer (&self->reply, g_byte_array_unref);
+  self->reply = g_byte_array_sized_new (t->actual_length);
+  g_byte_array_append (self->reply, t->buffer, t->actual_length);
+  fpi_ssm_next_state (t->ssm);
+}
+
+static void
+recv_buf (FpiSsm *ssm, FpDevice *dev, guint8 ep, gsize len, guint timeout)
+{
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+
+  t->ssm = ssm;
+  fpi_usb_transfer_fill_bulk (t, ep, len);
+  fpi_usb_transfer_submit (t, timeout, NULL, recv_cb, NULL);
+}
+
+static void
+random_bytes (guint8 *out, gsize len, gboolean nonzero)
+{
+  RAND_bytes (out, len);
+  for (gsize i = 0; nonzero && i < len; i++)
+    while (out[i] == 0)
+      RAND_bytes (out + i, 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * Open: init sequence (plaintext), then the SSLv3 session. tools/ssl_session.py
+ * ------------------------------------------------------------------------- */
+enum open_states {
+  OPEN_INIT_PAUSE,
+  OPEN_INIT_SEND,
+  OPEN_INIT_RECV,
+  OPEN_INIT_CHECK,
+  OPEN_UNLOAD_PAUSE,      /* patches still loaded: 1a UnloadPatch, like HP */
+  OPEN_UNLOAD_SEND,
+  OPEN_UNLOAD_RECV,
+  OPEN_UNLOAD_DONE,
+  OPEN_FLASH_RECV,        /* 1f SPI flash read: the data follows on ep 0x82 */
+  OPEN_FLASH_DONE,
+  OPEN_HELLO_SEND,
+  OPEN_HELLO_RECV,
+  OPEN_FLIGHT_SEND,
+  OPEN_FLIGHT_RECV,
+  OPEN_FLIGHT_CHECK,
+  OPEN_VERSION_SEND,
+  OPEN_VERSION_RECV,
+  OPEN_VERSION_CHECK,
+  OPEN_NUM_STATES,
+};
+
+static GBytes *
+init_cmd (FpDeviceVfs495 *self)
+{
+  return g_ptr_array_index (self->setup->init, self->init_idx);
+}
+
+static void
+open_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+  g_autoptr(GError) error = NULL;
+  const guint8 *cmd;
+  gsize cmdlen;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case OPEN_INIT_PAUSE:
+      if (self->init_idx >= self->setup->init->len)
+        fpi_ssm_jump_to_state (ssm, OPEN_HELLO_SEND);
+      else
+        fpi_ssm_next_state_delayed (ssm, INIT_PAUSE);
+      break;
+
+    case OPEN_INIT_SEND:
+      cmd = g_bytes_get_data (init_cmd (self), &cmdlen);
+      send_buf (ssm, dev, cmd, cmdlen);
+      break;
+
+    case OPEN_INIT_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_SMALL, CMD_TIMEOUT);
+      break;
+
+    case OPEN_INIT_CHECK:
+      cmd = g_bytes_get_data (init_cmd (self), &cmdlen);
+      if (self->reply->len >= 1 && self->reply->data[0] == VFS495_REC_ALERT)
+        {
+          /* still in a session from an earlier process: the sensor resets itself and re-enumerates */
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                              "sensor held a stale session and is resetting; try again"));
+          return;
+        }
+      if (cmd[0] == VFS495_CMD_GET_VERSION && self->reply->len > 17 && self->reply->data[17] && !self->flash)
+        fpi_ssm_jump_to_state (ssm, OPEN_UNLOAD_PAUSE);
+      else if (cmd[0] == VFS495_CMD_SPI_BULK_READ && cmdlen >= 9)
+        fpi_ssm_jump_to_state (ssm, OPEN_FLASH_RECV);
+      else
+        {
+          self->init_idx++;
+          fpi_ssm_jump_to_state (ssm, OPEN_INIT_PAUSE);
+        }
+      break;
+
+    case OPEN_UNLOAD_PAUSE:
+      fp_dbg ("patches still loaded: unloading first");
+      fpi_ssm_next_state_delayed (ssm, INIT_PAUSE);
+      break;
+
+    case OPEN_UNLOAD_SEND:
+      send_buf (ssm, dev, (const guint8 *) "\x1a", 1);
+      break;
+
+    case OPEN_UNLOAD_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_SMALL, CMD_TIMEOUT);
+      break;
+
+    case OPEN_UNLOAD_DONE:
+      self->init_idx++;
+      fpi_ssm_jump_to_state (ssm, OPEN_INIT_PAUSE);
+      break;
+
+    case OPEN_FLASH_RECV:
+      /* read exactly the requested size (u32 at offset 5): the sensor sends full packets, no short one */
+      cmd = g_bytes_get_data (init_cmd (self), &cmdlen);
+      recv_buf (ssm, dev, VFS495_EP_DATA_IN, cmd[5] | (cmd[6] << 8) | (cmd[7] << 16) | ((guint32) cmd[8] << 24), 1000);
+      break;
+
+    case OPEN_FLASH_DONE:
+      if (self->reply->len == 0x1000)
+        {
+          g_clear_pointer (&self->flash, g_bytes_unref);
+          self->flash = g_bytes_new (self->reply->data, self->reply->len);
+        }
+      self->init_idx++;
+      fpi_ssm_jump_to_state (ssm, OPEN_INIT_PAUSE);
+      break;
+
+    case OPEN_HELLO_SEND:
+      {
+        guint8 client_random[VFS495_SSL_RANDOM_LEN], premaster[VFS495_SSL_PREMASTER_LEN];
+
+        if (!self->flash)
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                                "init read no flash block (setup file incomplete?)"));
+            return;
+          }
+        random_bytes (client_random, sizeof (client_random), FALSE);
+        random_bytes (premaster, sizeof (premaster), FALSE);
+        vfs495_handshake_clear (&self->hs);
+        vfs495_handshake_init (&self->hs, client_random, premaster);
+        send_array (ssm, dev, vfs495_handshake_hello (&self->hs));
+      }
+      break;
+
+    case OPEN_HELLO_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_SMALL, CMD_TIMEOUT);
+      break;
+
+    case OPEN_FLIGHT_SEND:
+      {
+        g_autoptr(GBytes) modulus = vfs495_flash_storage (g_bytes_get_data (self->flash, NULL),
+                                                          g_bytes_get_size (self->flash), 10);
+        guint8 pad[VFS495_RSA_LEN - 3 - VFS495_SSL_PREMASTER_LEN];
+        GByteArray *flight;
+
+        if (!modulus)
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                                "RSA key (storage id 10) not found in sensor flash"));
+            return;
+          }
+        random_bytes (pad, sizeof (pad), TRUE);
+        flight = vfs495_handshake_flight (&self->hs, &self->ssl, self->reply->data, self->reply->len,
+                                          g_bytes_get_data (modulus, NULL), g_bytes_get_size (modulus),
+                                          pad, &error);
+        if (!flight)
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "%s", error->message));
+            return;
+          }
+        send_array (ssm, dev, flight);
+      }
+      break;
+
+    case OPEN_FLIGHT_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_SMALL, CMD_TIMEOUT);
+      break;
+
+    case OPEN_FLIGHT_CHECK:
+      if (!vfs495_handshake_verify (&self->hs, &self->ssl, self->reply->data, self->reply->len, &error))
+        {
+          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "handshake: %s", error->message));
+          return;
+        }
+      vfs495_handshake_clear (&self->hs);
+      self->session_open = TRUE;
+      fp_dbg ("secure session open, sensor Finished verified");
+      fpi_ssm_next_state (ssm);
+      break;
+
+    case OPEN_VERSION_SEND:
+      send_array (ssm, dev, vfs495_ssl_encrypt (&self->ssl, VFS495_REC_APPDATA, (const guint8 *) "\x01", 1));
+      break;
+
+    case OPEN_VERSION_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_LARGE, CMD_TIMEOUT);
+      break;
+
+    case OPEN_VERSION_CHECK:
+      {
+        g_autoptr(GByteArray) plain = vfs495_ssl_decrypt (&self->ssl, self->reply->data, self->reply->len,
+                                                          NULL, &error);
+        if (!plain || plain->len < 2 || plain->data[0] || plain->data[1])
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "encrypted GetVersion failed%s%s",
+                                                                error ? ": " : "", error ? error->message : ""));
+            return;
+          }
+        fp_dbg ("encrypted GetVersion ok (%u B reply)", plain->len);
+        fpi_ssm_mark_completed (ssm);
+      }
+      break;
+    }
+}
+
+static void
+release_usb (FpDeviceVfs495 *self)
+{
+  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (self)), 0, 0, NULL);
+  g_clear_pointer (&self->setup, vfs495_setup_free);
+  g_clear_pointer (&self->flash, g_bytes_unref);
+  g_clear_pointer (&self->reply, g_byte_array_unref);
+  vfs495_handshake_clear (&self->hs);
+  self->session_open = FALSE;
+}
+
+static void
+open_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+
+  if (error)
+    release_usb (self);
+  fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
+}
+
 static void
 dev_open (FpImageDevice *dev)
 {
@@ -263,21 +525,73 @@ dev_open (FpImageDevice *dev)
       fpi_image_device_open_complete (dev, error);
       return;
     }
-  fpi_image_device_open_complete (dev, NULL);
+
+  self->init_idx = 0;
+  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), open_run_state, OPEN_NUM_STATES), open_complete);
+}
+
+/* ---------------------------------------------------------------------------
+ * Close: encrypted close_notify (01 00), like HP on exit. Without it the sensor keeps the session
+ * and resets itself on the next open (a re-enumeration). Errors here are not fatal.
+ * ------------------------------------------------------------------------- */
+enum close_states {
+  CLOSE_SEND,
+  CLOSE_RECV,
+  CLOSE_CHECK,
+  CLOSE_NUM_STATES,
+};
+
+static void
+close_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case CLOSE_SEND:
+      if (!self->session_open)
+        {
+          fpi_ssm_mark_completed (ssm);
+          return;
+        }
+      send_array (ssm, dev, vfs495_ssl_encrypt (&self->ssl, VFS495_REC_ALERT, (const guint8 *) "\x01\x00", 2));
+      break;
+
+    case CLOSE_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_SMALL, 1000);
+      break;
+
+    case CLOSE_CHECK:
+      {
+        g_autoptr(GByteArray) plain = NULL;
+        guint8 type = 0;
+
+        plain = vfs495_ssl_decrypt (&self->ssl, self->reply->data, self->reply->len, &type, NULL);
+        fp_dbg ("session closed: %s", plain && type == VFS495_REC_ALERT ? "sensor confirmed" : "NOT confirmed");
+        fpi_ssm_mark_completed (ssm);
+      }
+      break;
+    }
+}
+
+static void
+close_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  if (error)
+    fp_dbg ("close_notify failed: %s", error->message);
+  g_clear_error (&error);
+  release_usb (FPI_DEVICE_VFS495 (dev));
+  fpi_image_device_close_complete (FP_IMAGE_DEVICE (dev), NULL);
 }
 
 static void
 dev_close (FpImageDevice *dev)
 {
-  GError *error = NULL;
   FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
 
   g_clear_pointer (&self->capture_buf, g_free);
   g_slist_free_full (g_steal_pointer (&self->rows), g_free);
-  g_clear_pointer (&self->setup, vfs495_setup_free);
-  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
-                                  0, 0, &error);
-  fpi_image_device_close_complete (dev, error);
+  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), close_run_state, CLOSE_NUM_STATES), close_complete);
 }
 
 static void

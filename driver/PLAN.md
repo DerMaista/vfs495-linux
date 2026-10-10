@@ -121,6 +121,15 @@ Gap: no repo tool produces `capture_cmds.json` from a fresh HP trace yet (it cam
 key-block dump at `scsSSLRsaPublicEncrypt` + usblog trace + record decryption). Needed for any second
 device; `trace_to_init.py` only covers the init part.
 
+**Phase 3 — done (2026-10-10).** `driver/vfs495_ssl.c`: the session protocol (PRF, Validity RSA byte order,
+Finished, record MAC/encryption, flash storage table) on OpenSSL, no USB. `tests/test_ssl.sh` runs
+`tools/ssl_session.py` against a simulated sensor with fixed randomness and checks the C layer byte for byte
+(ClientHello, key exchange flight, sensor Finished, encrypted GetVersion + reply, close_notify, tampered
+record rejected). `vfs495.c`: `dev_open` runs the init sequence (30 ms pauses, `1a` unload when patches are
+still loaded, exact-size flash reads), takes the RSA key from storage id 10, does the handshake and an
+encrypted GetVersion; `dev_close` sends close_notify. Hardware: 3x open/session/GetVersion/close through
+libfprint, sensor confirmed every close, USB address unchanged (no re-enumeration), ~0.6 s per open.
+
 **Notes for phase 5 (from the offline/live assembly tests, FINDINGS 2026-10-10):**
 - `resolution` must be ~8, not ~4: the lag is measured in lines (50–170), and HP's rule is 8 lines of lag =
   1 output row (7 and 9 both scored worse).
