@@ -17,10 +17,13 @@
 
 #include "drivers_api.h"
 #include "vfs495_proto.h"
+#include "vfs495_setup.h"
 
 struct _FpDeviceVfs495
 {
   FpImageDevice parent;
+
+  Vfs495Setup  *setup;            /* init/setup commands (VFS495_SETUP_PATH) */
 
   guint8       *capture_buf;      /* raw ep2 DLI bytes                 */
   gsize         capture_len;
@@ -239,10 +242,24 @@ static void
 dev_open (FpImageDevice *dev)
 {
   GError *error = NULL;
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
   GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (dev));
+  const char *path = g_getenv ("VFS495_SETUP") ?: VFS495_SETUP_PATH;
+
+  /* HP's per-device patches + setup commands, recorded once (tools/make_setup_bin.py) */
+  self->setup = vfs495_setup_load (path, &error);
+  if (!self->setup)
+    {
+      g_prefix_error (&error, "%s: ", path);
+      fpi_image_device_open_complete (dev, error);
+      return;
+    }
+  fp_dbg ("setup: %u init + %u setup commands from %s",
+          self->setup->init->len, self->setup->setup->len, path);
 
   if (!g_usb_device_claim_interface (usb, 0, 0, &error))
     {
+      g_clear_pointer (&self->setup, vfs495_setup_free);
       fpi_image_device_open_complete (dev, error);
       return;
     }
@@ -257,6 +274,7 @@ dev_close (FpImageDevice *dev)
 
   g_clear_pointer (&self->capture_buf, g_free);
   g_slist_free_full (g_steal_pointer (&self->rows), g_free);
+  g_clear_pointer (&self->setup, vfs495_setup_free);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                   0, 0, &error);
   fpi_image_device_close_complete (dev, error);
