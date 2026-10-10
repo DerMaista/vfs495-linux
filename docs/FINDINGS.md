@@ -563,3 +563,149 @@ authenticated to the device. Synthesizing the `02` config ourselves would remove
 still leave the `06` patches, so it is a lot of work for a cosmetic win. The practical minimal-proprietary
 setup already stands: capture the patches + config once from the user's own sensor, replay forever, never run
 HP again. Analogous to needing linux-firmware for wifi/GPU. (vfs495_native_capture.py / the libfprint driver.)
+
+## Which HP patches does the sensor need? Live probes (2026-10-10) -> tools/probe_patches.py
+Question: can setup.bin be made without running HP's binary (or without any HP file)? Probed on the sensor with
+subsets of the recorded commands (RAM only, nothing written to flash). Variants: A = no patches at all,
+B = only the 693 B init patch (stored verbatim in validity-sensor), C = both init patches, setup without its
+06/1a, D = no init patches, setup as recorded.
+
+| run | sensor state before | variant | result |
+|-----|---------------------|---------|--------|
+| 1 | patches loaded by the driver, unloaded with 1a | A | session opened; setup stops at the 2691 B config (`5004`), the 2666 B one returns no data; sensor reset right after |
+| 1 | after that reset | C | session ok (GetVersion patch byte 07); same stop as A |
+| 2 | after C, patches unloaded | D | ClientHello tunnel refused in plaintext: `2b04` |
+| 2 | | B | `2b04` |
+| 3 | | A | `2b04` |
+| 3 | sensor resetting (delayed, after the 2b04) | C, A | I/O error / timeout: inconclusive |
+| 4 | forced reset (R), back 1.2 s before | A, E | init timed out (sensor not ready yet?): inconclusive |
+| 4 | clean (patch byte 00) | C | same as run 1: 2666 B no data, 2691 B `5004`; no reset afterwards (20 s) |
+| 4 | after C's clean close, 1a, no reset | A | `2b04`: the leftover theory is wrong |
+| 4 | after that 2b04, no reset for 20 s | F | I/O error on first access, then the sensor reset: inconclusive |
+| 4 | clean | G (no 405 B) | **every config accepted**, 2666 B returns its data; armed; no finger seen |
+| 4 | | H (no 1301 B reload) | every config accepted; armed; no finger seen (swipe missed) |
+| 5 | forced reset, 5 s wait | A, E | init times out at the 4 KiB flash read (`1f05`); never reached the handshake |
+| 5 | forced reset | F | session ok, then I/O error uploading the 405 B patch; sensor reset |
+| 5 | forced reset | G (no 405 B) | **capture works**: finger detected, 8283 lines streamed (not decoded) |
+| 5 | after G's clean close | H (no 1301 B reload) | **capture works**: 4647 lines streamed (not decoded) |
+| 6 | forced reset | A | `1f05` **rejected `6d04`** (no data); handshake with an earlier step's key refused **`2604`** (not `2b04`) |
+| 6 | forced reset | E (1301 B only) | `1f05` rejected `6d04`; the **1301 B upload kills the sensor** (I/O error, reset) |
+| 6 | forced reset | F | again I/O error uploading the 405 B patch (2/2, both right after a failed E) |
+| 6 | forced reset | H | capture works, decoded: 5196 lines -> 200x300 print |
+| 6 | forced reset | G (no 405 B) | capture works, decoded: 4590 lines -> 200x300 print (not yet scored) |
+| 7 | forced reset (no A/E before) | F | I/O error uploading the 405 B patch again (3/3) |
+| 7 | forced reset | H, 5 swipes | 5/5 prints; NBIS among them: 8/20 pairs >= 40 (swipe 3 matches none) |
+| 7 | forced reset | G, 5 swipes | **finger never detected** in 5 swipes (the user swiped); no print |
+| 8 | forced reset | F (traced) | 405 B upload #1 fine; 2666 B config's data read times out (3 s); `12`, `1a`, then the **write** of 405 B upload #2 fails (I/O error) |
+| 8 | forced reset | G, 3 swipes | finger detected 3/3, 3 prints |
+| 8 | forced reset | H, 3 swipes | finger detected 3/3, 3 prints |
+| 8 | forced reset | G, 3 swipes | no finger in 15 s (user swiped), then 2 partial swipes (1300 / 1553 lines) |
+
+Findings:
+- **The session needs HP's 1301 B security patch.** On a sensor without a patched session, the ROM refuses
+  the 0x11 handshake tunnel (`2b04`, plaintext status, no alert), 3/3 times. The 693 B patch alone doesn't help.
+  So the earlier assumption "the session is a ROM feature" is wrong; it comes with HP's security patch.
+- Run 1's A success is NOT leftover state from a clean close + `1a`: run 4's C A (exactly that) got `2b04`.
+  Unexplained; run 1 came after the driver's full setup (with the 405 / 2581 B patches), not after C.
+- **Setup needs the setup patches** (405 B x3, 2581 B, 1301 B): without them, the config commands up to the
+  2625 B one are accepted and return their calibration data, the 2666 B one returns none, and the 2691 B
+  one is rejected (`5004`). Both init patches present (C) or not (A) makes no difference there.
+- After a refused handshake (`2b04`) the sensor does NOT reset by itself (run 4: none within 20 s). It stays
+  broken until the next access, which gets an I/O error and makes it reset. Run 3's "delayed reset" was that.
+  Force a reset after a 2b04 (the probe now does). After a forced reset, the first init timed out twice
+  although the sensor was back on the bus 1.2 s earlier: wait longer (the probe now waits 5 s).
+- **The 2581 B patch is what the 2666 B and 2691 B configs need** (run 4 G): without any 405 B patch, all
+  configs are accepted and the 2666 B one returns its data. See the next section for the TLV types.
+- **A capture works without the 405 B patch** (run 5 G: 693 + 1301 B at init, 2581 + 1301 B in setup) and
+  without HP's 1301 B reload (H). Not yet checked: that G's stream decodes into a print as good as the full
+  setup's (the probe now decrypts and assembles it).
+- **The 693 B patch is the bootstrap.** On a freshly reset sensor without it, the ROM rejects the 4 KiB flash
+  read (`1f05` -> `6d04`, the read that holds the RSA key), refuses the handshake even with a known key
+  (`2604`), and an upload of the 1301 B patch makes the sensor fail and reset (run 6 A, E). After a session with
+  it plus `1a`, the read works without it (run 4 A). Fits the headers: 693 B is the one patch with an RSA
+  signature (ROM-verifiable); the others carry the 32 B per-sensor authenticator, which the 693 B code
+  presumably checks. So 693 B -> 1301 B -> 2581 B is a dependency chain, not three independent features.
+- F's failure is not about the 405 B patch (run 8 trace): the first 405 B upload works. Without the 2581 B
+  patch the 2666 B config returns its status but no data (as in C), and after that the sensor is in a bad
+  state: the next patch upload's USB write fails and the sensor resets. ("last command" pointed at the first
+  405 B upload in runs 5-7 only because both records have the same size.)
+- **Without the 405 B patch, finger detection is unreliable and prints are worse.** G found the finger in 7 of
+  13 prompts over runs 5-8 (H: 11/11 in runs 7-8); the user swiped every time. NBIS, probe prints of one
+  finger (partial swipes and the < 80-row one left out; probe-H-1791663402 / -1791664001 left out, they come
+  from runs not in this table):
+
+  | pairs | mean | >= 40 |
+  |-------|------|-------|
+  | H vs H (8 prints) | 32.9 | 21/56 |
+  | G vs H (3 x 8)    | 28.7 | 6/48  |
+  | G vs G (3 prints) | 20.9 | 0/6   |
+
+  The finger poll looks the same with and without it (`00..` then `0000 02..`). So the 405 B patch is not
+  needed for the configs or the stream, but for the sensor to work well; it's loaded right before the
+  calibration configs (2331 B, 2691 B), so probably calibration / detection. It stays in setup.bin.
+- Probe prints score lower than the driver's (H: 8/20 pairs >= 40 vs the driver's 73/90): rushed swipes in a
+  15 s window and no fast-swipe gate. Compare G against H from the same probe, not against the driver.
+
+Consequence: a setup.bin without HP's binary would need the transformed patches, i.e. HP's per-sensor patch
+authentication (see "Static patch extraction is a dead end"), which this project keeps out of scope. The
+one-time vfs495-setup run stays.
+
+Next step (open): **understand what the security patches do**: what the 1301 B patch adds (the session,
+key handling), what the 405 B / 2581 B setup patches enable (which config fields and sensor modes need them),
+and why the 2666 B / 2691 B configs depend on them. That could show whether the sensor's ROM offers another
+way to capture, or which patch is the real minimum. It is protocol and behaviour work on the sensor;
+reproducing the patch authentication stays out of scope.
+
+## What the patches and configs look like on the wire (2026-10-10, offline, T6) -> tools/probe_patches.py
+From the recorded commands only (captures/*.json), no HP binary.
+- **`06` patch header:** `06 | 02 00 | u16le auth length | auth | body`. The 693 B patch carries a 256 B
+  auth (the RSA signature: this is the copy stored verbatim in validity-sensor). The 405 / 1301 / 2581 B patches
+  carry 32 B (HP's per-sensor authenticator, see "Static patch extraction is a dead end"). Bodies 368 / 432 /
+  1264 / 2544 B, entropy 7.3-7.9 bit/byte: encrypted. Their content can't be read, so what each patch does
+  can only be learned from the sensor's behaviour.
+- **`02` config = 5 B header + TLV list** (u16le type, u16le length, payload). All 12 recorded configs parse
+  exactly to their end. Type 3 (9 B) = register write `u32le addr, u32le value, u8 width` (60-82 per config,
+  60 distinct addresses 0x30042000..0x38000014); type 2 (1408 B) is in every config (6 variants), probably the
+  timeslot table.
+- **Type 6 (106 B) = the stream crypto block:** 96 B random + fixed `..0003 0000 0401`. The image key and IV
+  of the arming command (offsets 2927 / 2959) are its first 48 B. The calibration configs (2331 B, both
+  2691 B) have one too, with the first 64 B random; the arming config randomizes all 96 B (the driver
+  replaces only key + IV, the other 48 B stay as recorded and work).
+- **TLV types vs the patch HP loads right before the config:**
+
+  | config (setup #) | patch before | TLV types beyond 2/3/10/21 | without setup patches (run 1) |
+  |------------------|--------------|----------------------------|-------------------------------|
+  | 2331 B (3)       | 405 B        | 6                          | accepted, data returned        |
+  | 2711-2625 B (6-12) | 2581 B     | 5, 12-18 (calibration scans) | accepted, data returned      |
+  | 2666 B (13)      | (2581 B)     | 5, 7, 12, 17, **19, 20, 29** | accepted, **no data**        |
+  | 2691 B (17, 22)  | 405 B        | 5, 6, **23, 27**           | **rejected 5004**              |
+  | 3033 B (23, arming) | 405 B     | 5, 6, 23, 27, **24** (338 B) | never reached                |
+
+  So the ROM handles types 5, 6 and 12-18; the first types it doesn't are 19/20/29/7 and 23/27. Run 4's G
+  (no 405 B patch, 2581 B loaded) accepted all of them incl. the arming config's type 24: **the 2581 B patch
+  adds 19/20/29/7 and 23/27** (or makes the ROM accept them). The 1301 B patch adds the session. What the
+  405 B patch is not needed for any config to be accepted, but without it finger detection is unreliable and
+  prints match worse (run 8): probably calibration.
+
+**Patch roles (behaviour, runs 1-8; one sensor):**
+
+| patch | auth | needed for | without it |
+|-------|------|------------|------------|
+| 693 B | RSA signature | everything: 4 KiB flash read (RSA key), handshake, loading the other patches | `1f05` -> `6d04`, handshake `2604`, 1301 B upload kills the sensor |
+| 1301 B | 32 B per-sensor | the SSL session | handshake refused `2b04` |
+| 2581 B | 32 B per-sensor | config TLV types 19/20/29/7 (2666 B) and 23/27 (2691 B, arming) | 2666 B gives no data, 2691 B `5004`; the sensor then fails on the next patch write |
+| 405 B | 32 B per-sensor | reliable finger detection, print quality (calibration?) | ~half the swipes undetected, prints match worse |
+
+HP's 1301 B reload during setup isn't needed (H works the same). The minimum stays all four patches. The register writes don't explain it: configs 13/17/23 write no address
+  the ROM-accepted configs don't, only 15-16 different values.
+- **The session survives an unload:** HP's own setup sends `1a` after the 1301 B reload and then loads only the
+  405 B patch, and the session carries on through arming and capture. So once the handshake is done, the
+  session doesn't need the 1301 B code resident. That fits run 1's A (a new handshake right after an unload,
+  no reset): the 1301 B patch probably leaves something behind that only a reset clears.
+
+Probe extensions to test this (`tools/probe_patches.py`, `--plan` prints each step without the sensor):
+R forces a clean sensor (stale session -> alert -> reset, waits for the re-enumeration); E = only the 1301 B
+patch; F / G / H = setup without the 2581 B patch / the 405 B patches / the 1301 B reload; T = no setup
+patches, but the 2691 / 3033 B configs without TLV types 23 and 27. Run 4 used `R A R E C A F G H`; run 5-6 used `R A R E R F R H R G`; after run 6 the default is `R F R H R G`. Probe
+hygiene: every step waits for a running reset instead of a fixed 3 s, plus 5 s after a re-enumeration; refusals,
+errors and rejections watch for a reset and force one if none comes (a 2b04 leaves the sensor broken).
