@@ -130,6 +130,16 @@ still loaded, exact-size flash reads), takes the RSA key from storage id 10, doe
 encrypted GetVersion; `dev_close` sends close_notify. Hardware: 3x open/session/GetVersion/close through
 libfprint, sensor confirmed every close, USB address unchanged (no re-enumeration), ~0.6 s per open.
 
+**Phase 4 — done (2026-10-10).** Capture loop in `vfs495.c` (one SSM run per swipe, restarted until
+deactivation): setup commands with a fresh random image key/IV in the arming command, `17` poll every 50 ms
+(finger-on reported to libfprint), ep 0x82 stream decrypted incrementally (one EVP AES-256-CBC context),
+272 B frames split, sequence gaps / bad frames counted, end on 150 ms read timeout / 4 s / quiet rule, then
+`04` abort, drain, reply consumed (SSL sequence stays in sync), finger-off. Deactivation while waiting for a
+finger disarms with `04`. `VFS495_RAW=FILE.npy` dumps the raw lines. Hardware: 3 swipes in one open
+session, ~8–12k lines each; their raw lines assembled by `tools/vfs495_assemble.py` give clean prints, so
+capture and decryption are correct. The interim `fpi_assemble_lines()` output (resolution 8, search 220)
+is unusable streaks, as predicted below: it stretches the resting part before the swipe.
+
 **Notes for phase 5 (from the offline/live assembly tests, FINDINGS 2026-10-10):**
 - `resolution` must be ~8, not ~4: the lag is measured in lines (50–170), and HP's rule is 8 lines of lag =
   1 output row (7 and 9 both scored worse).

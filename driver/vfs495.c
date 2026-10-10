@@ -7,8 +7,9 @@
  * the terms of the GNU Lesser General Public License, version 2.1 or later.
  *
  * STATUS (see PLAN.md): open/close run the sensor's init sequence and SSLv3 session (port of
- * tools/ssl_session.py, verified byte-exact offline by tests/test_ssl.sh). Capture (phase 4) and
- * assembly (phase 5) are still placeholders. Modeled on the vfs5011/vfs301 sibling drivers.
+ * tools/ssl_session.py, verified byte-exact offline by tests/test_ssl.sh); activation runs the capture
+ * loop (port of tools/vfs495_native_capture.py). The assembly is an interim fpi_assemble_lines()
+ * until phase 5. Modeled on the vfs5011/vfs301 sibling drivers.
  */
 
 #define FP_COMPONENT "vfs495"
@@ -18,26 +19,37 @@
 #include "vfs495_setup.h"
 #include "vfs495_ssl.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <openssl/evp.h>
 #include <openssl/rand.h>
 
 struct _FpDeviceVfs495
 {
-  FpImageDevice parent;
+  FpImageDevice   parent;
 
-  Vfs495Setup  *setup;            /* init/setup commands (VFS495_SETUP_PATH) */
-  Vfs495Ssl     ssl;
+  Vfs495Setup    *setup;          /* init/setup commands (VFS495_SETUP_PATH) */
+  Vfs495Ssl       ssl;
   Vfs495Handshake hs;
-  gboolean      session_open;
-  guint         init_idx;         /* next init command */
-  GBytes       *flash;            /* the 4 KiB flash block (storage table) */
-  GByteArray   *reply;            /* last reply read by recv () */
+  gboolean        session_open;
+  guint           init_idx;       /* next init command */
+  GBytes         *flash;          /* the 4 KiB flash block (storage table) */
+  GByteArray     *reply;          /* last reply read by recv_buf () */
 
-  guint8       *capture_buf;      /* raw ep2 DLI bytes                 */
-  gsize         capture_len;
-  GSList       *rows;             /* captured descrambled lines (g_malloc) */
-  gint          lines_recorded;
-  gboolean      deactivating;
-  gboolean      loop_running;
+  /* capture loop */
+  gboolean        loop_running;
+  gboolean        deactivating;
+  gboolean        activated;      /* activate_complete () sent */
+  gboolean        finger_on;
+  guint           setup_idx, read_idx;
+  guint8          image_key[32], image_iv[16];
+  EVP_CIPHER_CTX *image_cipher;   /* the swipe stream: one AES-256-CBC stream */
+  GByteArray     *stream;         /* decrypted bytes not yet split into frames */
+  GPtrArray      *lines;          /* raw (scrambled) 264 B lines of the current swipe */
+  gint64          stream_start;
+  double          peak;
+  guint           quiet, seq_gaps, bad_frames;
+  guint8          last_seq;
 };
 G_DECLARE_FINAL_TYPE (FpDeviceVfs495, fpi_device_vfs495, FPI, DEVICE_VFS495,
                       FpImageDevice)
@@ -45,48 +57,18 @@ G_DEFINE_TYPE (FpDeviceVfs495, fpi_device_vfs495, FP_TYPE_IMAGE_DEVICE)
 
 #include "vfs495_descramble.inc"
 
-/* ---------------------------------------------------------------------------
- * DLI line decode (UnpackLineRT): input = one framed line (8-byte header +
- * payload); output = VFS495_LINE_WIDTH descrambled 8-bit pixels.
- * Returns TRUE on success. Only the 8-bit-direct mode (our sensor) is wired up;
- * 4-bit / bit-packed modes are stubbed for other Falcon variants.
- * ------------------------------------------------------------------------- */
-static gboolean
-vfs495_decode_line (const guint8 *line, gsize len, guint8 *out /* [LINE_WIDTH] */)
-{
-  guint mode;
+static guint16 vfs495_unscramble[VFS495_LINE_WIDTH];   /* descrambled column -> raw position */
 
-  if (len < VFS495_LINE_HDR + VFS495_LINE_WIDTH)
-    return FALSE;
-
-  mode = line[6] & 0x0f;
-  if (mode != VFS495_DECODE_8BIT)
-    {
-      /* TODO: 4-bit and variable-bitlength modes (see UnpackLineRT). */
-      fp_dbg ("vfs495: unsupported decode mode %u", mode);
-      return FALSE;
-    }
-
-  /* 8-bit direct: out[descramble[i]] = payload[i] */
-  const guint8 *px = line + VFS495_LINE_HDR;
-  for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
-    out[vfs495_descramble[i]] = px[i];
-
-  return TRUE;
-}
-
-/* Assembly pulls the usable main-image columns (0..IMAGE_WIDTH-1). */
+/* Interim assembly (phase 5 replaces it). */
 static unsigned char
 vfs495_get_pixel (struct fpi_line_asmbl_ctx *ctx, GSList *row, unsigned x)
 {
-  (void) ctx;
-  return ((const guint8 *) row->data)[x];
+  return ((const guint8 *) row->data)[VFS495_IMAGE_WIDTH - 1 - x];   /* HP's output is mirrored */
 }
 
 static int
 vfs495_get_deviation (struct fpi_line_asmbl_ctx *ctx, GSList *a, GSList *b)
 {
-  /* Mean absolute difference between two lines -> movement proxy. */
   const guint8 *pa = a->data, *pb = b->data;
   int sum = 0;
 
@@ -97,125 +79,13 @@ vfs495_get_deviation (struct fpi_line_asmbl_ctx *ctx, GSList *a, GSList *b)
 
 static struct fpi_line_asmbl_ctx assembling_ctx = {
   .line_width         = VFS495_IMAGE_WIDTH,
-  .max_height         = 2000,
-  .resolution         = 10,
+  .max_height         = 300,
+  .resolution         = 8,
   .median_filter_size = 25,
-  .max_search_offset  = 30,
+  .max_search_offset  = 220,
   .get_deviation      = vfs495_get_deviation,
   .get_pixel          = vfs495_get_pixel,
 };
-
-/* ---------------------------------------------------------------------------
- * Capture SSM
- * ------------------------------------------------------------------------- */
-enum activate_states {
-  ACTIVATE_START,
-  ACTIVATE_AWAIT_FINGER,   /* poll finger state / interrupt ep 0x83          */
-  ACTIVATE_CAPTURE,        /* read DLI stream from ep 0x82                   */
-  ACTIVATE_PROCESS,        /* decode + descramble + assemble                 */
-  ACTIVATE_NUM_STATES,
-};
-
-static void
-vfs495_submit_image (FpiSsm *ssm, FpDeviceVfs495 *self, FpImageDevice *dev)
-{
-  FpImage *img;
-
-  if (self->lines_recorded < VFS495_IMAGE_WIDTH)
-    {
-      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
-      return;
-    }
-
-  self->rows = g_slist_reverse (self->rows);
-  img = fpi_assemble_lines (&assembling_ctx, self->rows, self->lines_recorded);
-  g_slist_free_full (g_steal_pointer (&self->rows), g_free);
-  self->lines_recorded = 0;
-
-  fpi_image_device_image_captured (dev, img);
-}
-
-/*
- * Split the raw ep2 DLI buffer into lines, decode+descramble each, and keep the
- * usable main-image columns. NOTE: line framing here is the simple magic-scan
- * placeholder; port irDliRTFalconData's stateful accumulator for robustness
- * (ridge data legitimately contains the 0x01/0xfe marker bytes).
- */
-static void
-vfs495_process_capture (FpDeviceVfs495 *self)
-{
-  const guint8 *b = self->capture_buf;
-  gsize n = self->capture_len, i = 0;
-  guint8 dec[VFS495_LINE_WIDTH];
-
-  while (i + VFS495_LINE_HDR + VFS495_LINE_WIDTH <= n)
-    {
-      if (b[i] == 0x01 && (b[i + 1] == 0x01 || b[i + 1] == 0xfe) &&
-          b[i + 3] == 0x00 && b[i + 7] == 0x00 &&
-          vfs495_decode_line (b + i, n - i, dec))
-        {
-          guint8 *keep = g_malloc (VFS495_IMAGE_WIDTH);
-          memcpy (keep, dec, VFS495_IMAGE_WIDTH); /* main-image columns */
-          self->rows = g_slist_prepend (self->rows, keep);
-          self->lines_recorded++;
-          i += VFS495_LINE_HDR + VFS495_LINE_WIDTH;
-        }
-      else
-        {
-          i++;
-        }
-    }
-}
-
-static void
-activate_run_state (FpiSsm *ssm, FpDevice *_dev)
-{
-  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
-  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (_dev);
-
-  switch (fpi_ssm_get_cur_state (ssm))
-    {
-    case ACTIVATE_START:
-      /* the session is already open (dev_open); phase 4: setup commands with a fresh image key */
-      fpi_image_device_activate_complete (dev, NULL);
-      fpi_ssm_next_state (ssm);
-      break;
-
-    case ACTIVATE_AWAIT_FINGER:
-      /* TODO: wait on interrupt ep 0x83 (finger event) or poll GET_FINGER_STATE. */
-      fpi_ssm_next_state (ssm);
-      break;
-
-    case ACTIVATE_CAPTURE:
-      /* TODO: issue GET_FINGERPRINT and read the DLI stream from ep 0x82 into
-       * self->capture_buf / capture_len via fpi_usb_transfer. */
-      fpi_ssm_next_state (ssm);
-      break;
-
-    case ACTIVATE_PROCESS:
-      if (self->capture_buf && self->capture_len)
-        vfs495_process_capture (self);
-      vfs495_submit_image (ssm, self, dev);
-      fpi_ssm_mark_completed (ssm);
-      break;
-    }
-}
-
-static void
-activate_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
-{
-  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
-  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (_dev);
-
-  self->loop_running = FALSE;
-  g_clear_pointer (&self->capture_buf, g_free);
-  self->capture_len = 0;
-
-  if (self->deactivating)
-    fpi_image_device_deactivate_complete (dev, error);
-  else if (error)
-    fpi_image_device_session_error (dev, error);
-}
 
 /* ---------------------------------------------------------------------------
  * USB helpers: every exchange is one SSM state that sends, one that reads into
@@ -482,6 +352,9 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
 static void
 release_usb (FpDeviceVfs495 *self)
 {
+  g_clear_pointer (&self->image_cipher, EVP_CIPHER_CTX_free);
+  g_clear_pointer (&self->stream, g_byte_array_unref);
+  g_clear_pointer (&self->lines, g_ptr_array_unref);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (self)), 0, 0, NULL);
   g_clear_pointer (&self->setup, vfs495_setup_free);
   g_clear_pointer (&self->flash, g_bytes_unref);
@@ -527,6 +400,9 @@ dev_open (FpImageDevice *dev)
     }
 
   self->init_idx = 0;
+  self->image_cipher = EVP_CIPHER_CTX_new ();
+  self->stream = g_byte_array_new ();
+  self->lines = g_ptr_array_new_with_free_func (g_free);
   fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), open_run_state, OPEN_NUM_STATES), open_complete);
 }
 
@@ -587,23 +463,414 @@ close_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 static void
 dev_close (FpImageDevice *dev)
 {
+  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), close_run_state, CLOSE_NUM_STATES), close_complete);
+}
+
+/* ---------------------------------------------------------------------------
+ * Capture loop, one swipe per run (tools/vfs495_native_capture.py):
+ * setup commands with a fresh image key -> poll 17 until a finger is on ->
+ * stream + decrypt the swipe from ep 0x82 -> 04 abort, drain, resync -> image.
+ * ------------------------------------------------------------------------- */
+#define FRAME_LEN        (VFS495_LINE_HDR + VFS495_LINE_WIDTH)   /* 272 B decrypted frame */
+#define STREAM_CHUNK     16384
+#define STREAM_TIMEOUT   150     /* ms; the sensor ends the stream ~0.4 s after the finger leaves */
+#define MAX_SWIPE_US     (4 * G_USEC_PER_SEC)
+#define QUIET_LINES      300     /* backup end rule: this many lines below QUIET_FRAC x peak energy */
+#define QUIET_FRAC       0.1
+#define FINGER_POLL_MS   50
+#define MIN_LINES        400     /* fewer decoded lines = no usable swipe */
+
+enum capture_states {
+  CAP_SETUP_SEND,
+  CAP_SETUP_RECV,
+  CAP_SETUP_CHECK,
+  CAP_SETUP_DATA,          /* ep 0x82 reads that follow some setup replies (calibration data) */
+  CAP_SETUP_DATA_DONE,
+  CAP_FINGER_SEND,         /* 17 GetFingerState: byte 2 bit 1 = finger */
+  CAP_FINGER_RECV,
+  CAP_FINGER_CHECK,
+  CAP_STREAM,
+  CAP_ABORT_SEND,          /* 04 AbortFingerprint */
+  CAP_DRAIN,
+  CAP_ABORT_RECV,
+  CAP_ABORT_CHECK,
+  CAP_NUM_STATES,
+};
+
+static Vfs495SetupCmd *
+setup_cmd (FpDeviceVfs495 *self)
+{
+  return g_ptr_array_index (self->setup->setup, self->setup_idx);
+}
+
+static void
+send_encrypted (FpiSsm *ssm, FpDevice *dev, const guint8 *payload, gsize len)
+{
   FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
 
-  g_clear_pointer (&self->capture_buf, g_free);
-  g_slist_free_full (g_steal_pointer (&self->rows), g_free);
-  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), close_run_state, CLOSE_NUM_STATES), close_complete);
+  send_array (ssm, dev, vfs495_ssl_encrypt (&self->ssl, VFS495_REC_APPDATA, payload, len));
+}
+
+/* Ridge contrast of one line: mean |difference| of neighbouring main-image pixels. */
+static double
+line_energy (const guint8 *px)
+{
+  guint sum = 0;
+
+  for (guint x = 0; x + 1 < VFS495_IMAGE_WIDTH; x++)
+    sum += abs ((int) px[vfs495_unscramble[x + 1]] - (int) px[vfs495_unscramble[x]]);
+  return (double) sum / (VFS495_IMAGE_WIDTH - 1);
+}
+
+/* Decrypted stream -> 272 B frames; keep the 264 raw (scrambled) pixels of each 01 fe frame.
+ * Returns FALSE when the backup end rule says the finger is gone. */
+static gboolean
+take_frames (FpDeviceVfs495 *self)
+{
+  gsize p = 0;
+
+  for (; p + FRAME_LEN <= self->stream->len; p += FRAME_LEN)
+    {
+      const guint8 *f = self->stream->data + p;
+      double e;
+
+      if (f[0] != 0x01 || f[1] != 0xfe)
+        {
+          self->bad_frames++;
+          continue;
+        }
+      if (self->lines->len && (guint8) (f[2] - self->last_seq) != 1)
+        self->seq_gaps++;
+      self->last_seq = f[2];
+      g_ptr_array_add (self->lines, g_memdup2 (f + VFS495_LINE_HDR, VFS495_LINE_WIDTH));
+
+      e = line_energy (f + VFS495_LINE_HDR);
+      self->peak = MAX (self->peak, e);
+      self->quiet = e < QUIET_FRAC * self->peak ? self->quiet + 1 : 0;
+    }
+  g_byte_array_remove_range (self->stream, 0, p);
+  return !(self->lines->len > 2 * QUIET_LINES && self->quiet >= QUIET_LINES);
+}
+
+static void
+stream_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+  int n = 0;
+
+  if (error)
+    {
+      if (!g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
+        {
+          fpi_ssm_mark_failed (t->ssm, error);
+          return;
+        }
+      g_error_free (error);                         /* the sensor ended the stream: swipe over */
+      fpi_ssm_next_state (t->ssm);
+      return;
+    }
+
+  g_byte_array_set_size (self->stream, self->stream->len + t->actual_length);
+  EVP_DecryptUpdate (self->image_cipher, self->stream->data + self->stream->len - t->actual_length, &n,
+                     t->buffer, t->actual_length);
+  g_byte_array_set_size (self->stream, self->stream->len - t->actual_length + n);
+
+  if (!take_frames (self) || g_get_monotonic_time () - self->stream_start > MAX_SWIPE_US)
+    fpi_ssm_next_state (t->ssm);
+  else
+    fpi_ssm_jump_to_state (t->ssm, CAP_STREAM);
+}
+
+static void
+drain_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer user_data, GError *error)
+{
+  if (error)                                        /* nothing left queued */
+    {
+      g_error_free (error);
+      fpi_ssm_next_state (t->ssm);
+    }
+  else
+    fpi_ssm_jump_to_state (t->ssm, CAP_DRAIN);
+}
+
+static void
+abort_recv_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+
+  g_clear_pointer (&self->reply, g_byte_array_unref);
+  self->reply = g_byte_array_new ();
+  if (error)
+    g_error_free (error);
+  else
+    g_byte_array_append (self->reply, t->buffer, t->actual_length);
+  fpi_ssm_next_state (t->ssm);
+}
+
+static void
+capture_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+  g_autoptr(GError) error = NULL;
+  FpiUsbTransfer *t;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case CAP_SETUP_SEND:
+      {
+        Vfs495SetupCmd *c;
+        const guint8 *data;
+        gsize len;
+        g_autofree guint8 *cmd = NULL;
+
+        if (self->setup_idx >= self->setup->setup->len)
+          {
+            /* armed: the sensor waits for a finger now */
+            if (!self->activated)
+              {
+                self->activated = TRUE;
+                fpi_image_device_activate_complete (idev, NULL);
+              }
+            fpi_ssm_jump_to_state (ssm, CAP_FINGER_SEND);
+            return;
+          }
+        c = setup_cmd (self);
+        data = g_bytes_get_data (c->cmd, &len);
+        cmd = g_memdup2 (data, len);
+        if (c->flags & VFS495_SETUP_ARMING)
+          {
+            /* the arming command carries the key the swipe stream is encrypted with: pick a fresh one */
+            random_bytes (self->image_key, sizeof (self->image_key), FALSE);
+            random_bytes (self->image_iv, sizeof (self->image_iv), FALSE);
+            memcpy (cmd + VFS495_ARM_KEY_OFF, self->image_key, sizeof (self->image_key));
+            memcpy (cmd + VFS495_ARM_IV_OFF, self->image_iv, sizeof (self->image_iv));
+          }
+        send_encrypted (ssm, dev, cmd, len);
+      }
+      break;
+
+    case CAP_SETUP_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_LARGE, CMD_TIMEOUT);
+      break;
+
+    case CAP_SETUP_CHECK:
+      {
+        g_autoptr(GByteArray) plain = vfs495_ssl_decrypt (&self->ssl, self->reply->data, self->reply->len,
+                                                          NULL, &error);
+        if (!plain || plain->len < 2 || plain->data[0] || plain->data[1])
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                                "setup command %02x rejected%s%s",
+                                                                ((const guint8 *) g_bytes_get_data (setup_cmd (self)->cmd, NULL))[0],
+                                                                error ? ": " : "", error ? error->message : ""));
+            return;
+          }
+        self->read_idx = 0;
+        fpi_ssm_jump_to_state (ssm, setup_cmd (self)->reads->len ? CAP_SETUP_DATA : CAP_SETUP_DATA_DONE);
+      }
+      break;
+
+    case CAP_SETUP_DATA:
+      recv_buf (ssm, dev, VFS495_EP_DATA_IN,
+                g_array_index (setup_cmd (self)->reads, guint32, self->read_idx), CMD_TIMEOUT);
+      break;
+
+    case CAP_SETUP_DATA_DONE:
+      if (setup_cmd (self)->reads->len && ++self->read_idx < setup_cmd (self)->reads->len)
+        {
+          fpi_ssm_jump_to_state (ssm, CAP_SETUP_DATA);
+          return;
+        }
+      self->setup_idx++;
+      fpi_ssm_jump_to_state (ssm, CAP_SETUP_SEND);
+      break;
+
+    case CAP_FINGER_SEND:
+      if (self->deactivating)
+        {
+          fpi_ssm_jump_to_state (ssm, CAP_ABORT_SEND);     /* disarm before leaving */
+          return;
+        }
+      send_encrypted (ssm, dev, (const guint8 *) "\x17", 1);
+      break;
+
+    case CAP_FINGER_RECV:
+      recv_buf (ssm, dev, VFS495_EP_CMD_IN, REPLY_LARGE, CMD_TIMEOUT);
+      break;
+
+    case CAP_FINGER_CHECK:
+      {
+        g_autoptr(GByteArray) plain = vfs495_ssl_decrypt (&self->ssl, self->reply->data, self->reply->len,
+                                                          NULL, &error);
+        if (!plain)
+          {
+            fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "%s", error->message));
+            return;
+          }
+        if (plain->len <= 2 || !(plain->data[2] & 0x02))
+          {
+            fpi_ssm_jump_to_state_delayed (ssm, CAP_FINGER_SEND, FINGER_POLL_MS);
+            return;
+          }
+        fp_dbg ("finger on");
+        fpi_image_device_report_finger_status (idev, TRUE);
+        self->finger_on = TRUE;
+
+        EVP_CIPHER_CTX_reset (self->image_cipher);
+        EVP_DecryptInit_ex (self->image_cipher, EVP_aes_256_cbc (), NULL, self->image_key, self->image_iv);
+        EVP_CIPHER_CTX_set_padding (self->image_cipher, 0);
+        g_byte_array_set_size (self->stream, 0);
+        g_ptr_array_set_size (self->lines, 0);
+        self->peak = 0;
+        self->quiet = self->seq_gaps = self->bad_frames = 0;
+        self->stream_start = g_get_monotonic_time ();
+        fpi_ssm_next_state (ssm);
+      }
+      break;
+
+    case CAP_STREAM:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, VFS495_EP_DATA_IN, STREAM_CHUNK);
+      fpi_usb_transfer_submit (t, STREAM_TIMEOUT, NULL, stream_cb, NULL);
+      break;
+
+    case CAP_ABORT_SEND:
+      send_encrypted (ssm, dev, (const guint8 *) "\x04", 1);
+      break;
+
+    case CAP_DRAIN:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, VFS495_EP_DATA_IN, STREAM_CHUNK);
+      fpi_usb_transfer_submit (t, 300, NULL, drain_cb, NULL);
+      break;
+
+    case CAP_ABORT_RECV:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, VFS495_EP_CMD_IN, REPLY_SMALL);
+      fpi_usb_transfer_submit (t, 1000, NULL, abort_recv_cb, NULL);
+      break;
+
+    case CAP_ABORT_CHECK:
+      {
+        /* consume the reply so the record sequence numbers stay in sync */
+        g_autoptr(GByteArray) plain = vfs495_ssl_decrypt (&self->ssl, self->reply->data, self->reply->len, NULL, NULL);
+
+        fpi_ssm_mark_completed (ssm);
+      }
+      break;
+    }
+}
+
+/* Optional raw dump for offline tuning (VFS495_RAW=FILE.npy): the scrambled lines, same layout as
+ * vfs495_native_capture.py VFS_RAW. Biometric data: written 0600. */
+static void
+dump_raw (FpDeviceVfs495 *self)
+{
+  const char *path = g_getenv ("VFS495_RAW");
+  g_autoptr(GByteArray) out = NULL;
+  g_autofree gchar *hdr = NULL;
+  gsize pad;
+
+  if (!path || !self->lines->len)
+    return;
+  hdr = g_strdup_printf ("{'descr': '|u1', 'fortran_order': False, 'shape': (%u, %d), }",
+                         self->lines->len, VFS495_LINE_WIDTH);
+  pad = 64 - (10 + strlen (hdr) + 1) % 64;
+  out = g_byte_array_new ();
+  g_byte_array_append (out, (const guint8 *) "\x93NUMPY\x01\x00", 8);
+  g_byte_array_append (out, (const guint8 *) (guint16[]) { GUINT16_TO_LE (strlen (hdr) + pad + 1) }, 2);
+  g_byte_array_append (out, (const guint8 *) hdr, strlen (hdr));
+  for (gsize i = 0; i < pad; i++)
+    g_byte_array_append (out, (const guint8 *) " ", 1);
+  g_byte_array_append (out, (const guint8 *) "\n", 1);
+  for (guint i = 0; i < self->lines->len; i++)
+    g_byte_array_append (out, g_ptr_array_index (self->lines, i), VFS495_LINE_WIDTH);
+
+  int fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0 || write (fd, out->data, out->len) != (gssize) out->len)
+    fp_warn ("could not write %s", path);
+  if (fd >= 0)
+    close (fd);
+}
+
+static void
+submit_image (FpDeviceVfs495 *self)
+{
+  FpImageDevice *dev = FP_IMAGE_DEVICE (self);
+  GSList *rows = NULL;
+  FpImage *img;
+
+  fp_dbg ("swipe: %u lines, %u sequence gaps, %u bad frames", self->lines->len, self->seq_gaps, self->bad_frames);
+  dump_raw (self);
+  if (self->lines->len < MIN_LINES)
+    {
+      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
+      return;
+    }
+
+  /* phase 5 replaces this: interim assembly of the main columns with libfprint's helper */
+  for (guint i = 0; i < self->lines->len; i++)
+    {
+      const guint8 *raw = g_ptr_array_index (self->lines, i);
+      guint8 *line = g_malloc (VFS495_IMAGE_WIDTH);
+
+      for (guint x = 0; x < VFS495_IMAGE_WIDTH; x++)
+        line[x] = raw[vfs495_unscramble[x]];
+      rows = g_slist_prepend (rows, line);
+    }
+  rows = g_slist_reverse (rows);
+  img = fpi_assemble_lines (&assembling_ctx, rows, self->lines->len);
+  g_slist_free_full (rows, g_free);
+  fpi_image_device_image_captured (dev, img);
+}
+
+static void start_capture (FpImageDevice *dev);
+
+static void
+capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+{
+  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (_dev);
+
+  if (!self->deactivating && !error && self->finger_on)
+    submit_image (self);
+  if (self->finger_on && !self->deactivating)
+    fpi_image_device_report_finger_status (dev, FALSE);
+  self->finger_on = FALSE;
+  self->loop_running = FALSE;
+
+  if (self->deactivating)
+    fpi_image_device_deactivate_complete (dev, error);
+  else if (error && !self->activated)
+    fpi_image_device_activate_complete (dev, error);
+  else if (error)
+    fpi_image_device_session_error (dev, error);
+  else
+    start_capture (dev);
+}
+
+static void
+start_capture (FpImageDevice *dev)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
+
+  self->loop_running = TRUE;
+  self->setup_idx = 0;
+  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), capture_run_state, CAP_NUM_STATES), capture_complete);
 }
 
 static void
 dev_activate (FpImageDevice *dev)
 {
   FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
-  FpiSsm *ssm;
 
   self->deactivating = FALSE;
-  self->loop_running = TRUE;
-  ssm = fpi_ssm_new (FP_DEVICE (dev), activate_run_state, ACTIVATE_NUM_STATES);
-  fpi_ssm_start (ssm, activate_complete);
+  self->activated = FALSE;
+  start_capture (dev);
 }
 
 static void
@@ -612,7 +879,7 @@ dev_deactivate (FpImageDevice *dev)
   FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (dev);
 
   if (self->loop_running)
-    self->deactivating = TRUE;
+    self->deactivating = TRUE;      /* the loop disarms the sensor and completes */
   else
     fpi_image_device_deactivate_complete (dev, NULL);
 }
@@ -643,6 +910,9 @@ fpi_device_vfs495_class_init (FpDeviceVfs495Class *klass)
   img_class->img_close = dev_close;
   img_class->activate = dev_activate;
   img_class->deactivate = dev_deactivate;
+
+  for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
+    vfs495_unscramble[vfs495_descramble[i]] = i;
 
   img_class->bz3_threshold = 20;
   img_class->img_width = VFS495_IMAGE_WIDTH;
