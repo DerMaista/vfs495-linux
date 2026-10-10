@@ -140,7 +140,21 @@ session, ~8–12k lines each; their raw lines assembled by `tools/vfs495_assembl
 capture and decryption are correct. The interim `fpi_assemble_lines()` output (resolution 8, search 220)
 is unusable streaks, as predicted below: it stretches the resting part before the swipe.
 
-**Notes for phase 5 (from the offline/live assembly tests, FINDINGS 2026-10-10):**
+**Phase 5 — done (2026-10-10), as a C port instead of `fpi_assemble_lines()`.** `driver/vfs495_assemble.c`
+ports `tools/vfs495_assemble.py` (scipy/numpy semantics reproduced: gaussian truncate 4 + reflect borders,
+`np.convolve 'same'`, `np.interp`, linear percentiles, numpy argmax tie-breaking in the Viterbi).
+`tests/test_assemble.sh RAW.npy...`: pixel-identical to the Python on 3 recorded driver swipes (max diff 0),
+1.1–1.9 s per swipe (-O2). The driver hands the 200 x <=300 image to libfprint; prints under 80 rows are
+retried. Also removed the scaffold's `bz3_threshold = 20` (half libfprint's default 40: too permissive).
+
+**Phase 6 — started.** First full-driver run (libfprint only, no HP, no Python): 6 swipes, one session,
+~7–8 s from prompt to image (about 3 s streaming + ~1 s assembly + setup); all six are prints, one-to-one
+scores mean 27.7, 1/15 >= 40 (best 71). The Python path on an earlier live set: mean 39.4, 7/15; same
+algorithm, so this is swipe-to-swipe variance, the open quality problem. Every swipe shows exactly 1
+sequence gap + 1 bad frame: probably one non-image block at the stream start; to check. Next: real
+fprintd enroll (5 samples) + verify with this libfprint, which is the measure that matters.
+
+**Notes that led to the phase 5 decision (from the offline/live assembly tests, FINDINGS 2026-10-10):**
 - `resolution` must be ~8, not ~4: the lag is measured in lines (50–170), and HP's rule is 8 lines of lag =
   1 output row (7 and 9 both scored worse).
 - `fpi_assemble_lines()` searches each line pair independently (one line vs. one line, no windowing) and

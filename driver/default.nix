@@ -9,7 +9,7 @@ libfprint.overrideAttrs (old: {
 
   postPatch = (old.postPatch or "") + ''
     mkdir -p libfprint/drivers/vfs495
-    for f in vfs495.c vfs495_proto.h vfs495_descramble.inc vfs495_setup.c vfs495_setup.h vfs495_ssl.c vfs495_ssl.h; do
+    for f in vfs495.c vfs495_proto.h vfs495_descramble.inc vfs495_setup.c vfs495_setup.h vfs495_ssl.c vfs495_ssl.h vfs495_assemble.c vfs495_assemble.h; do
       cp ${./.}/$f libfprint/drivers/vfs495/
     done
 
@@ -17,7 +17,7 @@ libfprint.overrideAttrs (old: {
     substituteInPlace libfprint/meson.build \
       --replace-fail "    'vfs5011' : files('drivers/vfs5011.c')," \
                      "    'vfs5011' : files('drivers/vfs5011.c'),
-    'vfs495' : files('drivers/vfs495/vfs495.c', 'drivers/vfs495/vfs495_setup.c', 'drivers/vfs495/vfs495_ssl.c'),"
+    'vfs495' : files('drivers/vfs495/vfs495.c', 'drivers/vfs495/vfs495_setup.c', 'drivers/vfs495/vfs495_ssl.c', 'drivers/vfs495/vfs495_assemble.c'),"
     substituteInPlace meson.build \
       --replace-fail "    'vfs5011': { 'endian_dependent': true }," \
                      "    'vfs5011': { 'endian_dependent': true },

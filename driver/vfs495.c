@@ -8,8 +8,8 @@
  *
  * STATUS (see PLAN.md): open/close run the sensor's init sequence and SSLv3 session (port of
  * tools/ssl_session.py, verified byte-exact offline by tests/test_ssl.sh); activation runs the capture
- * loop (port of tools/vfs495_native_capture.py). The assembly is an interim fpi_assemble_lines()
- * until phase 5. Modeled on the vfs5011/vfs301 sibling drivers.
+ * loop (port of tools/vfs495_native_capture.py); vfs495_assemble.c turns a swipe into an image
+ * (port of tools/vfs495_assemble.py, pixel-identical on recorded swipes). Modeled on the vfs5011/vfs301 sibling drivers.
  */
 
 #define FP_COMPONENT "vfs495"
@@ -18,6 +18,7 @@
 #include "vfs495_proto.h"
 #include "vfs495_setup.h"
 #include "vfs495_ssl.h"
+#include "vfs495_assemble.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -58,34 +59,6 @@ G_DEFINE_TYPE (FpDeviceVfs495, fpi_device_vfs495, FP_TYPE_IMAGE_DEVICE)
 #include "vfs495_descramble.inc"
 
 static guint16 vfs495_unscramble[VFS495_LINE_WIDTH];   /* descrambled column -> raw position */
-
-/* Interim assembly (phase 5 replaces it). */
-static unsigned char
-vfs495_get_pixel (struct fpi_line_asmbl_ctx *ctx, GSList *row, unsigned x)
-{
-  return ((const guint8 *) row->data)[VFS495_IMAGE_WIDTH - 1 - x];   /* HP's output is mirrored */
-}
-
-static int
-vfs495_get_deviation (struct fpi_line_asmbl_ctx *ctx, GSList *a, GSList *b)
-{
-  const guint8 *pa = a->data, *pb = b->data;
-  int sum = 0;
-
-  for (unsigned x = 0; x < ctx->line_width; x++)
-    sum += abs ((int) pa[x] - (int) pb[x]);
-  return sum / (int) ctx->line_width;
-}
-
-static struct fpi_line_asmbl_ctx assembling_ctx = {
-  .line_width         = VFS495_IMAGE_WIDTH,
-  .max_height         = 300,
-  .resolution         = 8,
-  .median_filter_size = 25,
-  .max_search_offset  = 220,
-  .get_deviation      = vfs495_get_deviation,
-  .get_pixel          = vfs495_get_pixel,
-};
 
 /* ---------------------------------------------------------------------------
  * USB helpers: every exchange is one SSM state that sends, one that reads into
@@ -479,6 +452,7 @@ dev_close (FpImageDevice *dev)
 #define QUIET_FRAC       0.1
 #define FINGER_POLL_MS   50
 #define MIN_LINES        400     /* fewer decoded lines = no usable swipe */
+#define VFS495_MIN_ROWS  80      /* shorter assembled prints are retried (the bridge's VFS_MIN_ROWS) */
 
 enum capture_states {
   CAP_SETUP_SEND,
@@ -801,30 +775,34 @@ static void
 submit_image (FpDeviceVfs495 *self)
 {
   FpImageDevice *dev = FP_IMAGE_DEVICE (self);
-  GSList *rows = NULL;
+  g_autofree guint8 *lines = NULL, *px = NULL;
   FpImage *img;
+  guint h = 0;
 
   fp_dbg ("swipe: %u lines, %u sequence gaps, %u bad frames", self->lines->len, self->seq_gaps, self->bad_frames);
   dump_raw (self);
-  if (self->lines->len < MIN_LINES)
+  if (self->lines->len >= MIN_LINES)
     {
+      lines = g_new (guint8, self->lines->len * VFS495_LINE_WIDTH);
+      for (guint t = 0; t < self->lines->len; t++)
+        {
+          const guint8 *raw = g_ptr_array_index (self->lines, t);
+
+          for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
+            lines[t * VFS495_LINE_WIDTH + vfs495_descramble[i]] = raw[i];   /* out[perm[i]] = raw[i] */
+        }
+      px = vfs495_assemble (lines, self->lines->len, &h);
+    }
+  if (!px || h < VFS495_MIN_ROWS)
+    {
+      fp_dbg ("no usable print (%u rows)", h);
       fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
       return;
     }
 
-  /* phase 5 replaces this: interim assembly of the main columns with libfprint's helper */
-  for (guint i = 0; i < self->lines->len; i++)
-    {
-      const guint8 *raw = g_ptr_array_index (self->lines, i);
-      guint8 *line = g_malloc (VFS495_IMAGE_WIDTH);
-
-      for (guint x = 0; x < VFS495_IMAGE_WIDTH; x++)
-        line[x] = raw[vfs495_unscramble[x]];
-      rows = g_slist_prepend (rows, line);
-    }
-  rows = g_slist_reverse (rows);
-  img = fpi_assemble_lines (&assembling_ctx, rows, self->lines->len);
-  g_slist_free_full (rows, g_free);
+  img = fp_image_new (VFS495_ASM_WIDTH, h);
+  memcpy (img->data, px, VFS495_ASM_WIDTH * h);
+  fp_dbg ("image %dx%u", VFS495_ASM_WIDTH, h);
   fpi_image_device_image_captured (dev, img);
 }
 
@@ -914,7 +892,6 @@ fpi_device_vfs495_class_init (FpDeviceVfs495Class *klass)
   for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
     vfs495_unscramble[vfs495_descramble[i]] = i;
 
-  img_class->bz3_threshold = 20;
   img_class->img_width = VFS495_IMAGE_WIDTH;
   img_class->img_height = -1;
 }
