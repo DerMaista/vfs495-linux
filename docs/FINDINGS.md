@@ -491,3 +491,48 @@ running HP's binary, so the native path needs no HP execution at all. Result: no
   the sole benefit of skipping ONE HP run at setup. Not worth it, and it is the sensor's protection
   mechanism. Keep the community approach: user downloads HP's package, runtime/trace_to_init.py captures the
   init+setup blobs from ONE traced HP run; after that HP never runs again (native session/capture/decrypt).
+
+## HP-style assembly reimplemented + validated against HP's own images (2026-10-10) -> tools/vfs495_assemble.py
+Method: 6 swipes through HP's binary under gdb, saving per swipe BOTH the decrypted frames (irDliRTFalconData)
+and HP's assembled image (IRqualityDetermination). Our assembly runs on HP's exact input; scored with
+vfs495-match (fprintd's NBIS matcher). Monotone DP alignment of every HP output row to its source input line
+recovered HP's real row<->line mapping (ground truth for the lag), orientation and polarity.
+
+| pipeline (same 6 swipes)                                  | vs HP images (30 pairs) | ours vs ours (15) |
+|-----------------------------------------------------------|-------------------------|-------------------|
+| HP vs HP                                                   | 77.7 (15/15 >= 40)      |                   |
+| old native path (reconstruct.py)                           | 2.5  (0/30)             | 15.7 (1/15)       |
+| HP's own row mapping ("oracle") + our band-passed pixels   | 26.3 (5/30)             | 28.1              |
+| oracle mapping + raw pixels, inverted, column stretch      | 42.7 (15/30)            | 32.7              |
+| **vfs495_assemble.py** (own lag, Viterbi penalty 0.01)     | **50.5 (18/30)**        | **48.8 (6/15)**   |
+| same, lag penalty 0.002 / 0.005 / 0.02 / 0.05              | 35.0 / 36.0 / 44.5 / 36.0 | 37 / 44 / 46 / 39 |
+| same, constant lag per swipe                               | 23.5                    | 19.0              |
+| same, ref lag 7 / 9 instead of 8                           | 42.3 / 22.5             | 41.7 / 42.5       |
+
+What mattered (corrections to the section above):
+- Lag scale: real aux->main lags are 50..170 LINES (not ~4 px worth); HP's "8 lines = 1 output row" holds in raw
+  line units (~10 input lines per output row; ref 8 beats 7 and 9). Not a fixed divisor of a pixel speed.
+- Lag cleanup: greedy per-line tracking (HP's prev-8..prev+7 search) slid into a spurious lag ~3 minimum on our
+  data. A Viterbi path over windowed (48-line) correlation with a cost per unit of lag change is the working
+  stand-in for HP's gap-interp + med5 + stable-segment cleanup. Speed variation within a swipe is real
+  (constant lag scores 23).
+- Swipe span: HP uses the faint tail of the swipe (~1000-1500 lines past our old energy cut); end threshold
+  10% of peak energy. Output = first 300 rows from contact (HP: 5/6 swipes exactly 300 rows).
+- Pixels: HP keeps raw sensor values (pores, ridge shape). Band-passed/locally normalized rows lose most
+  minutiae for NBIS. Polarity is INVERTED vs raw; L-R mirrored; NOT vertically flipped (time runs top->bottom).
+  Column percentile stretch (1/94) = HP's IRConstrastEnhanceImageCols; baseline subtraction adds nothing on top.
+- Sideways drift (xlag/skew): HP's rows are not shifted vs their source lines on these swipes (the +-5 px
+  "shifts" were half a ridge period = the polarity inversion). Not implemented; no measurable need.
+Remaining gap to HP (50 vs 78): lag estimate (oracle mapping alone is not the ceiling, HP's analog
+reconstruction not ported). vfs495_native_capture.py's quiet end-rule was lowered to 10% of peak so the tail
+the assembly needs is not cut off.
+
+Live test (native capture, no HP binary, same day): 3 swipes scored 24 / 7 / 4. One swipe was mostly vertical
+streaks: the finger RESTED on the sensor before moving, and every resting line still emitted rows. HP's
+detectStictionZone case; none of the 6 HP swipes had a pause, so offline validation could not see it.
+Fix (vfs495_assemble.moving): similarity of a line with the line 64 earlier is ~0.83-0.95 while the finger
+rests (and before contact), < 0.5 while it moves; lines above 0.75 advance 0 rows, their lag windows are
+ignored, and the image starts at the first moving line. 6 new live swipes (2 with a deliberate ~1 s rest):
+all six give clean prints; one-to-one scores mean 39.4, 7/15 >= 40 (best 73), the two rest-first swipes
+score like the others. (The stiction step was tuned on live data only; the offline HP comparison above was
+done before it, with those recordings already deleted.)

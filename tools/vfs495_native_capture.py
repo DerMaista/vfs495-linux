@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """EXPERIMENTAL native VFS495 capture: no HP binary, no gdb. Same interface as the gdb-based capture.py.
 
-Status: capture + decryption work; the image assembly (reconstruct.py) is not yet good enough for
-reliable matching. Not used by the bridge.
+Status: capture + decryption work; the image assembly (vfs495_assemble.py, modelled on HP's) matches
+HP's own images offline (score ~50 vs HP's 78 HP-to-HP) but is not yet validated live. Not used by the bridge.
 
     sudo python3 vfs495_native_capture.py OUT.pgm        env: VFS_TIMEOUT (s to wait for a finger, default 60)
+                                                          VFS_RAW=FILE.npy also saves the raw scan lines (biometric data!)
 
 Pipeline: secure session (ssl_session.py) -> setup/calibration commands -> arming command with a fresh
 random AES-256 image key -> poll 17 until a finger is on -> stream the encrypted swipe from ep 0x82 and
 decrypt it on the fly (one AES-256-CBC stream) -> stop when the sensor ends the stream (it does so ~0.4 s
 after the finger leaves) or line energy stays low -> descramble (driver/vfs495_descramble.inc) ->
-reconstruct.py -> 8-bit PGM of the main 200 columns. The session is always closed (close_notify).
+vfs495_assemble.py -> 8-bit PGM (<= 300 x 200, like HP's). The session is always closed (close_notify).
 
 Needs captures/init_cmds.json (runtime/trace_to_init.py) and captures/capture_cmds.json (HP's setup
 commands, decrypted once from a traced HP session; HP's data, not redistributed).
@@ -29,7 +30,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import reconstruct  # noqa: E402
+import vfs495_assemble  # noqa: E402
 import ssl_session as S  # noqa: E402
 
 CAP = HERE + "/../captures"
@@ -37,9 +38,8 @@ KEY_OFF, IV_OFF, ARM_LEN = 2927, 2959, 3033   # image key/IV inside the arming c
 FRAME, HDR, WIDTH, MAIN = 272, 8, 264, 200    # decrypted frame: 8 B header + 264 pixels; cols 0..199 = print
 READ_TIMEOUT_MS = 150      # the sensor ends the stream on its own; a read timeout = swipe over
 QUIET_LINES = 300          # backup end rule: this many lines below QUIET_FRAC * peak energy
-QUIET_FRAC = 0.5
+QUIET_FRAC = 0.1           # low: the swipe's faint tail still carries print (HP uses it)
 MAX_SWIPE_S = 4.0
-RIDGE_PERIOD = 10.5       # typical ridge spacing in px on this sensor (fallback for the stretch fit)
 MIN_LINES = 400            # fewer decoded lines than this = no usable swipe
 
 
@@ -121,76 +121,10 @@ def stop_stream(dev, st):
         pass
 
 
-def _patch_freqs(img, ph=64, pw=32, pad=128):
-    """Dominant ridge frequency (fx, fy) in cycles/px of each coherent patch."""
-    h, w = img.shape
-    win = np.hanning(ph)[:, None] * np.hanning(pw)[None, :]
-    fy = np.fft.fftfreq(pad)[:, None] * np.ones((1, pad))
-    fx = np.ones((pad, 1)) * np.fft.fftfreq(pad)[None, :]
-    r = np.sqrt(fx ** 2 + fy ** 2)
-    band = (r > 1 / 60) & (r < 1 / 4)
-    out = []
-    for y0 in range(0, h - ph + 1, ph // 2):
-        for x0 in range(0, w - pw + 1, pw // 2):
-            p = img[y0:y0 + ph, x0:x0 + pw]
-            p = (p - p.mean()) * win
-            P = np.abs(np.fft.fft2(p, (pad, pad))) ** 2 * band
-            tot = P.sum()
-            if tot <= 0:
-                continue
-            i = np.unravel_index(np.argmax(P), P.shape)
-            if P[i] * 2 / tot < 0.04:            # no clear ridge direction in this patch
-                continue
-            out.append((abs(fx[i]), abs(fy[i])))
-    return np.array(out)
-
-
-def swipe_stretch(img):
-    """Stretch factor k of the swipe axis. Ridge spacing perpendicular to the ridges (1/f0) is ~constant over
-    a print, whatever the ridge direction, so every patch satisfies fx^2 + k^2 fy^2 = f0^2. Fitting that line
-    (fx^2 against fy^2) over patches of different ridge directions gives k without assuming isotropy."""
-    f = _patch_freqs(img)
-    if len(f) < 8:
-        return 1.0
-    X, Y = f[:, 1] ** 2, f[:, 0] ** 2
-    A = np.vstack([np.ones_like(X), -X]).T
-    a, y = A, Y
-    for _ in range(3):                          # least squares with outlier trimming
-        c, *_ = np.linalg.lstsq(a, y, rcond=None)
-        resid = np.abs(a @ c - y)
-        keep = resid <= np.percentile(resid, 80)
-        a, y = a[keep], y[keep]
-    f0sq, k2 = c
-    if np.isfinite(k2) and k2 > 0 and f0sq > 0 and 6.0 <= 1 / np.sqrt(f0sq) <= 16.0:
-        return float(min(max(np.sqrt(k2), 0.3), 8.0))
-    # too little spread in ridge direction (e.g. an arch): assume the typical ridge period instead
-    f0sq = (1 / RIDGE_PERIOD) ** 2
-    ok = (X > 1e-6) & (Y < f0sq)
-    if ok.sum() < 4:
-        return 1.0
-    return float(min(max(np.median(np.sqrt((f0sq - Y[ok]) / X[ok])), 0.3), 8.0))
-
-
-def isotropic(res, rounds=2):
-    """Resample the swipe axis so ridges have the same spacing in every direction (undo swipe speed)."""
-    for _ in range(rounds):
-        k = swipe_stretch(res)
-        h = res.shape[0]
-        rows = max(64, int(round(h / k)))
-        idx = np.linspace(0, h - 1, rows)
-        lo = np.floor(idx).astype(int); hi = np.minimum(lo + 1, h - 1); t = (idx - lo)[:, None]
-        res = res[lo] * (1 - t) + res[hi] * t
-    return res
-
-
 def to_image(raw, perm):
-    img = np.zeros((len(raw), WIDTH), np.float32)
+    img = np.zeros((len(raw), WIDTH), np.uint8)
     img[:, perm] = raw                        # descramble: out[perm[i]] = raw[i]
-    img = img[:, :MAIN]
-    res = reconstruct.preprocess(img)
-    lo, hi = reconstruct.best_segment(reconstruct.finger_energy(res))
-    seg = reconstruct.resample_uniform(res[lo:hi], reconstruct.novelty(res)[lo:hi])
-    return reconstruct.normalize(seg)   # isotropic() off: unreliable on real prints (see FINDINGS)
+    return vfs495_assemble.assemble(img)
 
 
 def main():
@@ -216,6 +150,9 @@ def main():
     if len(raw) < MIN_LINES:
         print("swipe too short (%d lines)" % len(raw), file=sys.stderr)
         return 10
+    if os.environ.get("VFS_RAW"):
+        with os.fdopen(os.open(os.environ["VFS_RAW"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            np.save(f, raw)
     img = to_image(raw, perm)
     with open(out, "wb") as f:
         f.write(f"P5\n{img.shape[1]} {img.shape[0]}\n255\n".encode())
