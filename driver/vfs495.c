@@ -497,7 +497,9 @@ line_energy (const guint8 *px)
 }
 
 /* Decrypted stream -> 272 B frames; keep the 264 raw (scrambled) pixels of each 01 fe frame.
- * Returns FALSE when the backup end rule says the finger is gone. */
+ * The stream ends with one 01 01 trailer frame (byte 3 = line count / 256). The first 16 lines are
+ * buffered from before the finger was detected; the line counter jumps after them (one "gap").
+ * Returns FALSE at the trailer, or when the backup end rule says the finger is gone. */
 static gboolean
 take_frames (FpDeviceVfs495 *self)
 {
@@ -508,13 +510,24 @@ take_frames (FpDeviceVfs495 *self)
       const guint8 *f = self->stream->data + p;
       double e;
 
+      if (f[0] == 0x01 && f[1] == 0x01)
+        {
+          fp_dbg ("end of stream after %u lines (trailer %02x)", self->lines->len, f[3]);
+          g_byte_array_set_size (self->stream, 0);
+          return FALSE;
+        }
       if (f[0] != 0x01 || f[1] != 0xfe)
         {
+          fp_dbg ("non-image frame after line %u: %02x %02x %02x %02x %02x %02x %02x %02x",
+                  self->lines->len, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
           self->bad_frames++;
           continue;
         }
       if (self->lines->len && (guint8) (f[2] - self->last_seq) != 1)
-        self->seq_gaps++;
+        {
+          fp_dbg ("sequence gap after line %u: %u -> %u", self->lines->len, self->last_seq, f[2]);
+          self->seq_gaps++;
+        }
       self->last_seq = f[2];
       g_ptr_array_add (self->lines, g_memdup2 (f + VFS495_LINE_HDR, VFS495_LINE_WIDTH));
 

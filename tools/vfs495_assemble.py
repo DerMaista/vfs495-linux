@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """VFS495 swipe assembly modelled on HP's IRreconstructImage chain (see docs/FINDINGS.md).
 
-    descrambled lines (n, 264) -> finger span -> drop resting-finger lines (stiction)
-    -> aux->main lag per line (Viterbi-smoothed) -> 8/lag output rows per line, linear interpolation between lines, max 300 rows
+    descrambled lines (n, 264) -> finger span -> start at sustained contact + motion -> drop resting lines
+    -> aux->main lag per line (Viterbi-smoothed) -> 7/lag output rows per line, linear interpolation between lines, max 300 rows
     -> raw sensor values, column percentile stretch, inverted, mirrored  -> uint8, 200 wide
 
 Validated offline against HP's own images of the same swipes (6 swipes, vfs495-match scores):
 HP vs HP 77.7, this vs HP 50.5 (18/30 >= 40), this vs this 48.8; the old reconstruct.py path 2.5 / 15.7.
 Live (native capture, 6 swipes incl. 2 resting first): one-to-one mean 39.4, 7/15 >= 40.
+Phase 6 (driver, 10 swipes finger A + 5 finger B): the sustained-contact start and REF_LAG 7 took genuine
+pairs from mean 22.4 (12/55 >= 40) to 47.6 (29/55); impostor pairs max 14 (0/50 >= 40). driver/PLAN.md.
 """
 import numpy as np
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
@@ -15,7 +17,8 @@ from scipy.ndimage import gaussian_filter, gaussian_filter1d
 MAIN = 200            # print columns
 AUX0, AUXW = 200, 64  # second sensor row: frame columns 200..263
 X0 = 70               # main column under aux column 0
-REF_LAG = 8.0         # HP: a lag of 8 lines = 1 output row (8 beats 7 and 9 on real swipes)
+REF_LAG = 7.0         # lag of 7 lines = 1 output row. HP uses 8 (best against HP's images); 7 is best for
+                      # matching our own swipes (more of the finger fits in 300 rows; 6 and 8 score lower)
 MAX_ROWS = 300        # HP stops filling at 300 rows
 LAGS = np.arange(20, 252, 2)   # plausible aux->main lags in lines (real swipes: ~50..170)
 
@@ -32,12 +35,18 @@ def prep(lines):
     return res - gaussian_filter(res, sigma=(0, 4))
 
 
-def finger_span(res, frac=0.3, endfrac=0.1, pad=20):
-    """Contact = energy first above median + frac*(max-median); end = last line above endfrac*max.
-    The tail of a swipe has low contrast but HP still uses it, so the end threshold is low."""
+def contact_energy(res, frac=0.3):
+    """Smoothed ridge energy per line and the full-contact threshold median + frac*(max-median)."""
     bp = gaussian_filter(res[:, :MAIN], (3, 1)) - gaussian_filter(res[:, :MAIN], (24, 6))
     e = gaussian_filter1d((bp ** 2).mean(1), 25)
-    on = np.where(e > np.median(e) + frac * (e.max() - np.median(e)))[0]
+    return e, np.median(e) + frac * (e.max() - np.median(e))
+
+
+def finger_span(res, endfrac=0.1, pad=20):
+    """Contact = energy first above the contact threshold; end = last line above endfrac*max.
+    The tail of a swipe has low contrast but HP still uses it, so the end threshold is low."""
+    e, thr = contact_energy(res)
+    on = np.where(e > thr)[0]
     if not len(on):
         return 0, len(res)
     tail = np.where(e > endfrac * e.max())[0]
@@ -51,6 +60,17 @@ def moving(res, k=64, still=0.75):
     sim = np.ones(len(m))
     sim[k:] = (m[k:] * m[:-k]).sum(1)
     return gaussian_filter1d(sim, 10) < still
+
+
+def swipe_start(res, mv, sustain=150):
+    """First line where the finger both moves and is in full contact, for most (80 %) of the next
+    `sustain` lines (HP: detectNoiseBeforeBase). Before it: touch-down spike, then a settling finger
+    whose noisy, weak-contact lines look like motion and assembled into smears. None if never."""
+    e, thr = contact_energy(res)
+    cond = (mv & (e > thr)).astype(int)
+    cond = np.convolve(cond, np.ones(sustain, int), "full")[sustain - 1:] * 5 >= sustain * 4   # >= 80 %
+    first = np.where(cond)[0]
+    return int(first[0]) if len(first) else None
 
 
 def lag_curve(res, step=16, win=48, xs=range(-8, 9, 2), penalty=0.01, mv=None):
@@ -115,6 +135,9 @@ def assemble(lines):
     res = prep(lines)
     lo, hi = finger_span(res)
     mv = moving(res)
+    start = swipe_start(res, mv)
+    if start is not None and lo <= start < hi:
+        lo = start
     on = np.where(mv[lo:hi])[0]
     if len(on):                                             # start at the first moving line, not at contact
         lo, hi = lo + on[0], lo + on[-1] + 1

@@ -18,7 +18,8 @@
 #define AUX0     200          /* second sensor row: columns 200..263 */
 #define AUXW     64
 #define X0       70           /* main column under aux column 0 */
-#define REF_LAG  8.0          /* HP: a lag of 8 lines = 1 output row */
+#define REF_LAG  7.0          /* a lag of 7 lines = 1 output row (HP: 8; 7 matches best, PLAN.md phase 6) */
+#define SUSTAIN  150          /* swipe start: moving + full contact for >= 80 % of the next 150 lines */
 #define LAG_MIN  20           /* plausible aux->main lags: 20, 22, .. 250 lines */
 #define LAG_STEP 2
 #define NLAGS    116
@@ -232,8 +233,9 @@ prep (const guint8 *lines, gsize n)
   return res;
 }
 
+/* finger_span + swipe_start share the smoothed ridge energy e and the contact threshold */
 static void
-finger_span (const float *res, gsize n, gsize *lo, gsize *hi)
+finger_span (const float *res, gsize n, gsize *lo, gsize *hi, double **energy, double *contact)
 {
   g_autofree float *a = g_new (float, n * MAIN);
   g_autofree float *b = NULL;
@@ -268,6 +270,7 @@ finger_span (const float *res, gsize n, gsize *lo, gsize *hi)
   for (gsize t = 0; t < n; t++)
     emax = MAX (emax, e[t]);
   thr = med + 0.3 * (emax - med);
+  *contact = thr;
   for (gsize t = 0; t < n; t++)
     {
       if (e[t] > thr)
@@ -279,6 +282,7 @@ finger_span (const float *res, gsize n, gsize *lo, gsize *hi)
       if (e[t] > 0.1 * emax)
         tail = t;
     }
+  *energy = g_steal_pointer (&e);
   if (first < 0)
     {
       *lo = 0;
@@ -287,6 +291,23 @@ finger_span (const float *res, gsize n, gsize *lo, gsize *hi)
     }
   *lo = first >= 20 ? first - 20 : 0;
   *hi = MIN (n, (gsize) MAX (last, tail) + 20);
+}
+
+/* First line where the finger both moves and is in full contact for >= 80 % of the next SUSTAIN lines
+ * (HP: detectNoiseBeforeBase). Before it: the touch-down spike, then a settling finger whose noisy
+ * weak-contact lines look like motion. Returns -1 if there is none. */
+static gssize
+swipe_start (const double *e, double thr, const gboolean *mv, gsize n)
+{
+  g_autofree guint *prefix = g_new (guint, n + 1);
+
+  prefix[0] = 0;
+  for (gsize t = 0; t < n; t++)
+    prefix[t + 1] = prefix[t] + (mv[t] && e[t] > thr);
+  for (gsize t = 0; t < n; t++)
+    if ((prefix[MIN (t + SUSTAIN, n)] - prefix[t]) * 5 >= SUSTAIN * 4)
+      return t;
+  return -1;
 }
 
 /* FALSE where the finger rests (HP's detectStictionZone). */
@@ -417,6 +438,9 @@ vfs495_assemble (const guint8 *lines, gsize n_all, guint *height)
 {
   g_autofree float *res = NULL;
   g_autofree gboolean *mv_all = NULL;
+  g_autofree double *energy = NULL;
+  double contact = 0;
+  gssize start;
   g_autofree double *lag = NULL, *pos = NULL, *xp = NULL, *fp = NULL, *col = NULL, *img = NULL;
   gsize lo, hi, n, rows, nk = 0;
   guint8 *out;
@@ -424,8 +448,11 @@ vfs495_assemble (const guint8 *lines, gsize n_all, guint *height)
   if (n_all < 2 * WIN)
     return NULL;
   res = prep (lines, n_all);
-  finger_span (res, n_all, &lo, &hi);
+  finger_span (res, n_all, &lo, &hi, &energy, &contact);
   mv_all = moving (res, n_all);
+  start = swipe_start (energy, contact, mv_all, n_all);
+  if (start >= (gssize) lo && start < (gssize) hi)
+    lo = start;
   {
     gssize first = -1, last = -1;
 

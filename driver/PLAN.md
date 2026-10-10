@@ -147,12 +147,29 @@ ports `tools/vfs495_assemble.py` (scipy/numpy semantics reproduced: gaussian tru
 1.1–1.9 s per swipe (-O2). The driver hands the 200 x <=300 image to libfprint; prints under 80 rows are
 retried. Also removed the scaffold's `bz3_threshold = 20` (half libfprint's default 40: too permissive).
 
-**Phase 6 — started.** First full-driver run (libfprint only, no HP, no Python): 6 swipes, one session,
-~7–8 s from prompt to image (about 3 s streaming + ~1 s assembly + setup); all six are prints, one-to-one
-scores mean 27.7, 1/15 >= 40 (best 71). The Python path on an earlier live set: mean 39.4, 7/15; same
-algorithm, so this is swipe-to-swipe variance, the open quality problem. Every swipe shows exactly 1
-sequence gap + 1 bad frame: probably one non-image block at the stream start; to check. Next: real
-fprintd enroll (5 samples) + verify with this libfprint, which is the measure that matters.
+**Phase 6 — done (2026-10-10).** Data: 10 swipes right index (A) + 5 right middle (B) through the driver,
+raw lines dumped; assembly variants built offline (C == Python, so Python is fine for tuning) and scored
+all-vs-all with fprintd's matcher. Genuine = A-A + B-B (55 pairs), impostor = A-B (50 pairs).
+
+| assembly                                   | genuine mean | genuine >= 40 | impostor max | A swipes matching another A |
+|--------------------------------------------|--------------|---------------|--------------|-----------------------------|
+| phase 5 (first moving line, ref 8)         | 22.4         | 12/55         | 19           | 5/10                        |
+| + start at contact (ref 8)                 | 32.5         | 21/55         | 15           | 8/10                        |
+| + start at contact, ref 7                  | 41.5         | 32/55         | 19           | 9/10                        |
+| **+ sustained contact start (150), ref 7** | **47.6**     | 29/55         | **14**       | 8/10                        |
+| same, ref 6                                | 37.9         | 26/55         | 19           | 8/10                        |
+
+Parameter sweeps on the phase 5 assembly (Viterbi penalty 0.005/0.02, ref 7/9, 400/500 rows, stiction
+0.65/0.85, percentiles 2/98, smoothing, dropping the 16 stale lines) all stayed within noise. The cause of
+the bad images was the swipe start: touch-down spike, then a settling finger whose noisy weak-contact lines
+looked like motion and assembled into smears. Fix (HP's detectNoiseBeforeBase): start at the first line
+that moves AND is above the contact threshold for >= 80 % of the next 150 lines. Ref 7 instead of HP's 8:
+more of the finger fits in 300 rows. Impostors never came near 40 (max 25 over all 18 variants).
+Adopted in `tools/vfs495_assemble.py` and `driver/vfs495_assemble.c` (still pixel-identical on all 15).
+Stream findings: the "bad frame" is the end-of-stream trailer `01 01 00 NN 07 07 08 00` (NN = lines/256),
+the driver now ends the swipe there instead of on the read timeout; the one "sequence gap" is after the
+first 16 lines (buffered from before finger detection; dropping them changed nothing measurable).
+Remaining: fast swipes (2/10) still give short, poor prints; the assembly blocks the main loop ~1-2 s.
 
 **Notes that led to the phase 5 decision (from the offline/live assembly tests, FINDINGS 2026-10-10):**
 - `resolution` must be ~8, not ~4: the lag is measured in lines (50–170), and HP's rule is 8 lines of lag =
