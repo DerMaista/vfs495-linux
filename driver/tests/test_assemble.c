@@ -17,6 +17,7 @@ main (int argc, char **argv)
   g_autofree guint8 *lines = NULL, *img = NULL;
   gsize len, hdr, n;
   guint h;
+  Vfs495AsmStats st;
   gint64 t0;
   FILE *f;
 
@@ -31,7 +32,9 @@ main (int argc, char **argv)
       lines[t * VFS495_LINE_WIDTH + vfs495_descramble[i]] = data[hdr + t * VFS495_LINE_WIDTH + i];
 
   t0 = g_get_monotonic_time ();
-  img = vfs495_assemble (lines, n, &h);
+  img = vfs495_assemble (lines, n, &h, &st);
+  fprintf (stderr, "%zu lines: %u moving, median lag %.1f, %.0f %% at the lag floor, %.0f rows\n",
+           n, st.moving, st.median_lag, 100 * st.floor_frac, st.rows);
   if (!img)
     return 1;
   fprintf (stderr, "%zu lines -> %dx%u in %.2f s\n", n, VFS495_ASM_WIDTH, h, (g_get_monotonic_time () - t0) / 1e6);

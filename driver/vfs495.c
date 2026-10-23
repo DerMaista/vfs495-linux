@@ -21,6 +21,7 @@
 #include "vfs495_assemble.h"
 
 #include <fcntl.h>
+#include <glib/gstdio.h>
 #include <unistd.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -65,7 +66,8 @@ static guint16 vfs495_unscramble[VFS495_LINE_WIDTH];   /* descrambled column -> 
  * self->reply, then a state that looks at the reply.
  * ------------------------------------------------------------------------- */
 #define CMD_TIMEOUT   3000
-#define INIT_PAUSE    30      /* ms between init commands: back to back, the sensor resets */
+#define INIT_PAUSE_DEFAULT 30 /* ms settle after a RAM-changing init cmd (patch 06 / unload 1a); the sensor
+                               * resets if the next command comes too soon. Env VFS495_INIT_PAUSE_MS overrides. */
 #define REPLY_SMALL   0x400   /* init + handshake replies */
 #define REPLY_LARGE   0x4000  /* encrypted command replies (the sensor ends them with a short packet) */
 
@@ -153,6 +155,36 @@ init_cmd (FpDeviceVfs495 *self)
   return g_ptr_array_index (self->setup->init, self->init_idx);
 }
 
+/* The sensor resets if a patch upload (06) / unload (1a) is followed immediately by the next command,
+ * so we settle only after those. Pure queries (GetVersion 01, SPI flash read 1f) need no fixed pause:
+ * we already wait for each reply before the next send. VFS495_INIT_PAUSE_MS overrides (0 disables). */
+static guint
+init_pause_ms (void)
+{
+  static gint ms = -1;
+
+  if (ms < 0)
+    {
+      const char *e = g_getenv ("VFS495_INIT_PAUSE_MS");
+
+      ms = e ? (gint) g_ascii_strtoll (e, NULL, 10) : INIT_PAUSE_DEFAULT;
+      ms = CLAMP (ms, 0, 5000);
+    }
+  return ms;
+}
+
+static gboolean
+prev_init_cmd_changes_ram (FpDeviceVfs495 *self)
+{
+  const guint8 *p;
+  gsize len;
+
+  if (self->init_idx == 0)
+    return FALSE;
+  p = g_bytes_get_data (g_ptr_array_index (self->setup->init, self->init_idx - 1), &len);
+  return len > 0 && (p[0] == VFS495_CMD_DOWNLOAD_PATCH || p[0] == VFS495_CMD_UNLOAD_PATCH);
+}
+
 static void
 open_run_state (FpiSsm *ssm, FpDevice *dev)
 {
@@ -166,8 +198,10 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
     case OPEN_INIT_PAUSE:
       if (self->init_idx >= self->setup->init->len)
         fpi_ssm_jump_to_state (ssm, OPEN_HELLO_SEND);
+      else if (prev_init_cmd_changes_ram (self) && init_pause_ms () > 0)
+        fpi_ssm_next_state_delayed (ssm, init_pause_ms ());
       else
-        fpi_ssm_next_state_delayed (ssm, INIT_PAUSE);
+        fpi_ssm_next_state (ssm);     /* query command: no fixed settle, the reply round-trip gates us */
       break;
 
     case OPEN_INIT_SEND:
@@ -201,7 +235,7 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
 
     case OPEN_UNLOAD_PAUSE:
       fp_dbg ("patches still loaded: unloading first");
-      fpi_ssm_next_state_delayed (ssm, INIT_PAUSE);
+      fpi_ssm_next_state_delayed (ssm, MAX (init_pause_ms (), 1));
       break;
 
     case OPEN_UNLOAD_SEND:
@@ -358,10 +392,19 @@ dev_open (FpImageDevice *dev)
   self->setup = vfs495_setup_load (path, &error);
   if (!self->setup)
     {
+      if (g_error_matches (error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
+        g_prefix_error (&error, "no setup file for this sensor yet, create it once with vfs495-setup: ");
       g_prefix_error (&error, "%s: ", path);
       fpi_image_device_open_complete (dev, error);
       return;
     }
+  {
+    GStatBuf st;
+
+    /* per-device firmware patches + session commands: root only */
+    if (g_stat (path, &st) == 0 && (st.st_mode & 077))
+      fp_warn ("%s is readable by other users (mode %03o); it should be 0600 root", path, st.st_mode & 0777);
+  }
   fp_dbg ("setup: %u init + %u setup commands from %s",
           self->setup->init->len, self->setup->setup->len, path);
 
@@ -452,7 +495,29 @@ dev_close (FpImageDevice *dev)
 #define QUIET_FRAC       0.1
 #define FINGER_POLL_MS   50
 #define MIN_LINES        400     /* fewer decoded lines = no usable swipe */
-#define VFS495_MIN_ROWS  80      /* shorter assembled prints are retried (the bridge's VFS_MIN_ROWS) */
+#define VFS495_MIN_ROWS_DEFAULT  80  /* shorter assembled prints are retried; env VFS495_MIN_ROWS overrides */
+/* Too fast: the finger crossed the two sensor rows in fewer lines than the lag search can resolve, so
+ * the speed is underestimated and the print comes out short and smeared. Measured (PLAN.md phase 7):
+ * normal swipes <= 2 % of the moving lines at the lag floor; fast ones that still matched 10 %;
+ * fast ones that matched nothing (score <= 15) 40-89 %. */
+#define FAST_FLOOR_FRAC  0.25
+
+/* Minimum assembled image rows; shorter prints are retried. The bridge exposes this as VFS_MIN_ROWS;
+ * mirror it in the native driver with VFS495_MIN_ROWS (default 80). */
+static guint
+min_rows (void)
+{
+  static gint n = -1;
+
+  if (n < 0)
+    {
+      const char *e = g_getenv ("VFS495_MIN_ROWS");
+
+      n = e ? (gint) g_ascii_strtoll (e, NULL, 10) : VFS495_MIN_ROWS_DEFAULT;
+      n = CLAMP (n, 0, 10000);
+    }
+  return n;
+}
 
 enum capture_states {
   CAP_SETUP_SEND,
@@ -630,8 +695,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
             /* the arming command carries the key the swipe stream is encrypted with: pick a fresh one */
             random_bytes (self->image_key, sizeof (self->image_key), FALSE);
             random_bytes (self->image_iv, sizeof (self->image_iv), FALSE);
-            memcpy (cmd + VFS495_ARM_KEY_OFF, self->image_key, sizeof (self->image_key));
-            memcpy (cmd + VFS495_ARM_IV_OFF, self->image_iv, sizeof (self->image_iv));
+            memcpy (cmd + c->key_off, self->image_key, sizeof (self->image_key));
+            memcpy (cmd + c->key_off + sizeof (self->image_key), self->image_iv, sizeof (self->image_iv));
           }
         send_encrypted (ssm, dev, cmd, len);
       }
@@ -752,18 +817,22 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
-/* Optional raw dump for offline tuning (VFS495_RAW=FILE.npy): the scrambled lines, same layout as
- * vfs495_native_capture.py VFS_RAW. Biometric data: written 0600. */
+/* Optional raw dump for offline tuning (VFS495_RAW=FILE.npy, or a directory: one swipe-NNN.npy per
+ * swipe): the scrambled lines, same layout as vfs495_native_capture.py VFS_RAW. Biometric data: 0600. */
 static void
 dump_raw (FpDeviceVfs495 *self)
 {
-  const char *path = g_getenv ("VFS495_RAW");
+  static guint swipe_no;
+  const char *raw = g_getenv ("VFS495_RAW");
+  g_autofree gchar *path = NULL;
   g_autoptr(GByteArray) out = NULL;
   g_autofree gchar *hdr = NULL;
   gsize pad;
 
-  if (!path || !self->lines->len)
+  if (!raw || !self->lines->len)
     return;
+  swipe_no++;
+  path = g_file_test (raw, G_FILE_TEST_IS_DIR) ? g_strdup_printf ("%s/swipe-%03u.npy", raw, swipe_no) : g_strdup (raw);
   hdr = g_strdup_printf ("{'descr': '|u1', 'fortran_order': False, 'shape': (%u, %d), }",
                          self->lines->len, VFS495_LINE_WIDTH);
   pad = 64 - (10 + strlen (hdr) + 1) % 64;
@@ -784,51 +853,81 @@ dump_raw (FpDeviceVfs495 *self)
     close (fd);
 }
 
+/* ---------------------------------------------------------------------------
+ * Assembly runs in a worker thread (~1-2 s per swipe); the main loop stays responsive.
+ * The task owns the swipe's lines; the device only sees the result.
+ * ------------------------------------------------------------------------- */
+typedef struct
+{
+  GPtrArray     *lines;          /* raw (scrambled) 264 B lines */
+  guint8        *px;
+  guint          height;
+  Vfs495AsmStats stats;
+} AssembleJob;
+
 static void
-submit_image (FpDeviceVfs495 *self)
+assemble_job_free (AssembleJob *job)
+{
+  g_clear_pointer (&job->lines, g_ptr_array_unref);
+  g_free (job->px);
+  g_free (job);
+}
+
+static void
+assemble_thread (GTask *task, gpointer source, gpointer task_data, GCancellable *cancellable)
+{
+  AssembleJob *job = task_data;
+  g_autofree guint8 *lines = g_new (guint8, job->lines->len * VFS495_LINE_WIDTH);
+
+  for (guint t = 0; t < job->lines->len; t++)
+    {
+      const guint8 *raw = g_ptr_array_index (job->lines, t);
+
+      for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
+        lines[t * VFS495_LINE_WIDTH + vfs495_descramble[i]] = raw[i];   /* out[perm[i]] = raw[i] */
+    }
+  job->px = vfs495_assemble (lines, job->lines->len, &job->height, &job->stats);
+  g_task_return_boolean (task, TRUE);
+}
+
+/* Image or retry, from the assembly result. */
+static void
+submit_image (FpDeviceVfs495 *self, AssembleJob *job)
 {
   FpImageDevice *dev = FP_IMAGE_DEVICE (self);
-  g_autofree guint8 *lines = NULL, *px = NULL;
+  const Vfs495AsmStats *st = &job->stats;
   FpImage *img;
-  guint h = 0;
 
-  fp_dbg ("swipe: %u lines, %u sequence gaps, %u bad frames", self->lines->len, self->seq_gaps, self->bad_frames);
-  dump_raw (self);
-  if (self->lines->len >= MIN_LINES)
+  fp_dbg ("assembly: %u moving lines, median lag %.1f, %.0f%% at the lag floor, %.0f rows",
+          st->moving, st->median_lag, 100 * st->floor_frac, st->rows);
+  if (st->floor_frac > FAST_FLOOR_FRAC)
     {
-      lines = g_new (guint8, self->lines->len * VFS495_LINE_WIDTH);
-      for (guint t = 0; t < self->lines->len; t++)
-        {
-          const guint8 *raw = g_ptr_array_index (self->lines, t);
-
-          for (guint i = 0; i < VFS495_LINE_WIDTH; i++)
-            lines[t * VFS495_LINE_WIDTH + vfs495_descramble[i]] = raw[i];   /* out[perm[i]] = raw[i] */
-        }
-      px = vfs495_assemble (lines, self->lines->len, &h);
+      fp_dbg ("swipe too fast");
+      fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_FAST);
+      return;
     }
-  if (!px || h < VFS495_MIN_ROWS)
+  if (!job->px || job->height < min_rows ())
     {
-      fp_dbg ("no usable print (%u rows)", h);
+      fp_dbg ("no usable print (%u rows)", job->height);
       fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
       return;
     }
 
-  img = fp_image_new (VFS495_ASM_WIDTH, h);
-  memcpy (img->data, px, VFS495_ASM_WIDTH * h);
-  fp_dbg ("image %dx%u", VFS495_ASM_WIDTH, h);
+  img = fp_image_new (VFS495_ASM_WIDTH, job->height);
+  memcpy (img->data, job->px, VFS495_ASM_WIDTH * job->height);
+  fp_dbg ("image %dx%u", VFS495_ASM_WIDTH, job->height);
   fpi_image_device_image_captured (dev, img);
 }
 
 static void start_capture (FpImageDevice *dev);
 
+/* End of one loop run: finger-off after the image (libfprint expects that order), then the next swipe
+ * or the deactivation / error the loop was waiting for. */
 static void
-capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+capture_finish (FpDeviceVfs495 *self, GError *error)
 {
-  FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
-  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (_dev);
+  FpImageDevice *dev = FP_IMAGE_DEVICE (self);
 
-  if (!self->deactivating && !error && self->finger_on)
-    submit_image (self);
   if (self->finger_on && !self->deactivating)
     fpi_image_device_report_finger_status (dev, FALSE);
   self->finger_on = FALSE;
@@ -842,6 +941,48 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
     fpi_image_device_session_error (dev, error);
   else
     start_capture (dev);
+}
+
+static void
+assemble_done (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (source);
+  AssembleJob *job = g_task_get_task_data (G_TASK (res));
+
+  /* deactivation requested meanwhile: the image is no longer wanted */
+  if (!self->deactivating)
+    submit_image (self, job);
+  capture_finish (self, NULL);
+}
+
+static void
+capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+{
+  FpDeviceVfs495 *self = FPI_DEVICE_VFS495 (_dev);
+
+  if (!self->deactivating && !error && self->finger_on)
+    {
+      g_autoptr(GTask) task = NULL;
+      AssembleJob *job;
+
+      fp_dbg ("swipe: %u lines, %u sequence gaps, %u bad frames", self->lines->len, self->seq_gaps, self->bad_frames);
+      dump_raw (self);
+      if (self->lines->len < MIN_LINES)
+        {
+          fp_dbg ("no usable print (%u lines)", self->lines->len);
+          fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_TOO_SHORT);
+          capture_finish (self, NULL);
+          return;
+        }
+      job = g_new0 (AssembleJob, 1);
+      job->lines = g_steal_pointer (&self->lines);
+      self->lines = g_ptr_array_new_with_free_func (g_free);
+      task = g_task_new (self, NULL, assemble_done, NULL);
+      g_task_set_task_data (task, job, (GDestroyNotify) assemble_job_free);
+      g_task_run_in_thread (task, assemble_thread);     /* loop_running stays TRUE until assemble_done */
+      return;
+    }
+  capture_finish (self, error);
 }
 
 static void

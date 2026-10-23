@@ -3,15 +3,22 @@
 # Dev build (any nixpkgs with libfprint 1.94.x):
 #   nix build --impure --expr '(builtins.getFlake "nixpkgs").legacyPackages.x86_64-linux.callPackage ./driver { }'
 # NixOS: services.fprintd.package = pkgs.fprintd.override { libfprint = pkgs.callPackage ./driver { }; };
-{ libfprint }:
+{ lib, libfprint }:
+let
+  files = [ "vfs495.c" "vfs495_proto.h" "vfs495_descramble.inc" "vfs495_setup.c" "vfs495_setup.h"
+            "vfs495_ssl.c" "vfs495_ssl.h" "vfs495_assemble.c" "vfs495_assemble.h" ];
+  # only the sources: editing docs or tests must not rebuild libfprint
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions (map (f: ./. + "/${f}") files);
+  };
+in
 libfprint.overrideAttrs (old: {
   pname = "libfprint-vfs495";
 
   postPatch = (old.postPatch or "") + ''
     mkdir -p libfprint/drivers/vfs495
-    for f in vfs495.c vfs495_proto.h vfs495_descramble.inc vfs495_setup.c vfs495_setup.h vfs495_ssl.c vfs495_ssl.h vfs495_assemble.c vfs495_assemble.h; do
-      cp ${./.}/$f libfprint/drivers/vfs495/
-    done
+    cp ${lib.concatMapStringsSep " " (f: "${src}/${f}") files} libfprint/drivers/vfs495/
 
     # register the driver: sources, and AES/SHA/MD5/RSA through libfprint's openssl helper
     substituteInPlace libfprint/meson.build \
