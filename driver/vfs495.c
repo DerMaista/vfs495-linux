@@ -66,8 +66,8 @@ static guint16 vfs495_unscramble[VFS495_LINE_WIDTH];   /* descrambled column -> 
  * self->reply, then a state that looks at the reply.
  * ------------------------------------------------------------------------- */
 #define CMD_TIMEOUT   3000
-#define INIT_PAUSE_DEFAULT 30 /* ms settle after a RAM-changing init cmd (patch 06 / unload 1a); the sensor
-                               * resets if the next command comes too soon. Env VFS495_INIT_PAUSE_MS overrides. */
+#define INIT_PAUSE_DEFAULT 30 /* ms between init commands: back to back, the sensor resets.
+                               * Env VFS495_INIT_PAUSE_MS overrides. */
 #define REPLY_SMALL   0x400   /* init + handshake replies */
 #define REPLY_LARGE   0x4000  /* encrypted command replies (the sensor ends them with a short packet) */
 
@@ -155,9 +155,8 @@ init_cmd (FpDeviceVfs495 *self)
   return g_ptr_array_index (self->setup->init, self->init_idx);
 }
 
-/* The sensor resets if a patch upload (06) / unload (1a) is followed immediately by the next command,
- * so we settle only after those. Pure queries (GetVersion 01, SPI flash read 1f) need no fixed pause:
- * we already wait for each reply before the next send. VFS495_INIT_PAUSE_MS overrides (0 disables). */
+/* Pause between init commands (back to back, the sensor resets). VFS495_INIT_PAUSE_MS overrides the
+ * default; lower it only on a known-good sensor, as a too-short pause makes the sensor reset mid-init. */
 static guint
 init_pause_ms (void)
 {
@@ -173,18 +172,6 @@ init_pause_ms (void)
   return ms;
 }
 
-static gboolean
-prev_init_cmd_changes_ram (FpDeviceVfs495 *self)
-{
-  const guint8 *p;
-  gsize len;
-
-  if (self->init_idx == 0)
-    return FALSE;
-  p = g_bytes_get_data (g_ptr_array_index (self->setup->init, self->init_idx - 1), &len);
-  return len > 0 && (p[0] == VFS495_CMD_DOWNLOAD_PATCH || p[0] == VFS495_CMD_UNLOAD_PATCH);
-}
-
 static void
 open_run_state (FpiSsm *ssm, FpDevice *dev)
 {
@@ -198,10 +185,10 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
     case OPEN_INIT_PAUSE:
       if (self->init_idx >= self->setup->init->len)
         fpi_ssm_jump_to_state (ssm, OPEN_HELLO_SEND);
-      else if (prev_init_cmd_changes_ram (self) && init_pause_ms () > 0)
+      else if (init_pause_ms () > 0)
         fpi_ssm_next_state_delayed (ssm, init_pause_ms ());
       else
-        fpi_ssm_next_state (ssm);     /* query command: no fixed settle, the reply round-trip gates us */
+        fpi_ssm_next_state (ssm);
       break;
 
     case OPEN_INIT_SEND:

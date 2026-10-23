@@ -65,11 +65,10 @@ To score images with fprintd's matcher: `../packaging/vfs495-fprint/usr/bin/vfs4
 ## Startup latency
 The old **bridge** backend (HP's binary under gdb + `FP_VIRTUAL_IMAGE`) took ~2 s to come up; the native
 driver opens in ~0.6 s and should be the default (`services.vfs495.backend = "native"`). Of that 0.6 s the
-only avoidable fixed delay is the inter-command settle during the init replay. The sensor only needs to
-settle after a RAM-changing command (patch upload `06` / unload `1a`); plain queries (`GetVersion 01`, SPI
-flash read `1f`) don't, because we already wait for each reply. The driver now pauses only after `06`/`1a`
-(was: after every init command), and the settle is tunable with **`VFS495_INIT_PAUSE_MS`** (default 30, `0`
-disables). Lower it to shave the open further; raise it if a sensor proves flaky. The setup/arming replay
+only fixed delay is the 30 ms pause before each of the 8 init commands; back to back, the sensor resets
+mid-init (a version that skipped the pause after query commands made the sensor re-enumerate on every
+open, so it is applied to every command). It is tunable with **`VFS495_INIT_PAUSE_MS`** (default 30); only
+lower it on a sensor you can test, and raise it if opens fail with `No such device`. The setup/arming replay
 (on each activate) already runs back-to-back with no fixed pause; its cost is the USB transfers + the few
 ep-0x82 calibration reads, not sleeps.
 
