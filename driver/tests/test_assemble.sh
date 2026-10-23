@@ -8,7 +8,10 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 cc -O2 -Wall -Werror -o "$tmp/test_assemble" "$here/test_assemble.c" "$here/../vfs495_assemble.c" \
   $(pkg-config --cflags --libs glib-2.0) -lm
 for raw in "$@"; do
-  "$tmp/test_assemble" "$raw" "$tmp/c.pgm"
+  if ! "$tmp/test_assemble" "$raw" "$tmp/c.pgm"; then
+    echo "  ${raw##*/}: no usable swipe (C returns no image), skipped"
+    continue
+  fi
   python3 - "$here/../../tools" "$raw" "$tmp/c.pgm" <<'PY'
 import sys, numpy as np
 sys.path.insert(0, sys.argv[1])

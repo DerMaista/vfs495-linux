@@ -139,8 +139,13 @@ vfs495_setup_parse (const guint8 *data, gsize len, GError **error)
         }
       if (c->flags & VFS495_SETUP_ARMING)
         {
-          if (g_bytes_get_size (c->cmd) < VFS495_ARM_IV_OFF + 16)
+          gsize clen;
+          const guint8 *cdata = g_bytes_get_data (c->cmd, &clen);
+          gssize off = vfs495_config_key_offset (cdata, clen);
+
+          if (off < 0)
             goto bad;
+          c->key_off = off;
           arming++;
         }
     }
@@ -154,6 +159,34 @@ bad:
   g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_INVAL,
                "VFS495 setup file is invalid (create it with tools/make_setup_bin.py)");
   return NULL;
+}
+
+/* Offset of the image key in an 02 config: the first 48 B (key + IV) of its type-6 TLV. The config is
+ * a 5 B header and then u16le type, u16le length, payload. 2927 in HP's 3033 B arming command; a config
+ * with TLVs removed (setup.bin --minimal) has it elsewhere. -1 if there is none or the TLVs don't parse. */
+gssize
+vfs495_config_key_offset (const guint8 *cmd, gsize len)
+{
+  gssize key = -1;
+  gsize o = 5;
+
+  if (len < 5 || cmd[0] != 0x02)
+    return -1;
+  while (o < len)
+    {
+      guint16 type, n;
+
+      if (len - o < 4)
+        return -1;
+      type = cmd[o] | cmd[o + 1] << 8;
+      n = cmd[o + 2] | cmd[o + 3] << 8;
+      if (len - o - 4 < n)
+        return -1;
+      if (type == 6 && n >= 48 && key < 0)
+        key = o + 4;
+      o += 4 + n;
+    }
+  return key;
 }
 
 Vfs495Setup *

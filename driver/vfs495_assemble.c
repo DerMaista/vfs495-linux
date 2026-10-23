@@ -20,7 +20,7 @@
 #define X0       70           /* main column under aux column 0 */
 #define REF_LAG  7.0          /* a lag of 7 lines = 1 output row (HP: 8; 7 matches best, PLAN.md phase 6) */
 #define SUSTAIN  150          /* swipe start: moving + full contact for >= 80 % of the next 150 lines */
-#define LAG_MIN  20           /* plausible aux->main lags: 20, 22, .. 250 lines */
+#define LAG_MIN  VFS495_ASM_LAG_MIN   /* plausible aux->main lags: 20, 22, .. 250 lines */
 #define LAG_STEP 2
 #define NLAGS    116
 #define STEP     16           /* lag window spacing */
@@ -433,9 +433,29 @@ lag_curve (const float *res, gsize n, const gboolean *mv)
   return lag;
 }
 
-guint8 *
-vfs495_assemble (const guint8 *lines, gsize n_all, guint *height)
+/* swipe_stats: speed and length of the swipe, for the driver's TOO_FAST / TOO_SHORT decision */
+static void
+swipe_stats (const double *lag, const gboolean *mv, gsize n, double rows, Vfs495AsmStats *stats)
 {
+  g_autofree double *v = g_new (double, n);
+  gsize m = 0, at_floor = 0;
+
+  for (gsize t = 0; t < n; t++)
+    if (mv[t])
+      {
+        v[m++] = lag[t];
+        at_floor += lag[t] <= LAG_MIN + LAG_STEP / 2.0;
+      }
+  stats->moving = m;
+  stats->median_lag = m ? percentile (v, m, 50) : 0;
+  stats->floor_frac = m ? (double) at_floor / m : 0;
+  stats->rows = rows;
+}
+
+guint8 *
+vfs495_assemble (const guint8 *lines, gsize n_all, guint *height, Vfs495AsmStats *stats)
+{
+  Vfs495AsmStats dummy;
   g_autofree float *res = NULL;
   g_autofree gboolean *mv_all = NULL;
   g_autofree double *energy = NULL;
@@ -445,6 +465,9 @@ vfs495_assemble (const guint8 *lines, gsize n_all, guint *height)
   gsize lo, hi, n, rows, nk = 0;
   guint8 *out;
 
+  if (!stats)
+    stats = &dummy;
+  memset (stats, 0, sizeof (*stats));
   if (n_all < 2 * WIN)
     return NULL;
   res = prep (lines, n_all);
@@ -480,6 +503,7 @@ vfs495_assemble (const guint8 *lines, gsize n_all, guint *height)
   pos[0] = 0;
   for (gsize t = 1; t < n; t++)
     pos[t] = pos[t - 1] + (mv_all[lo + t - 1] ? REF_LAG / MAX (lag[t - 1], 1.0) : 0.0);
+  swipe_stats (lag, mv_all + lo, n, pos[n - 1], stats);
   rows = MIN ((gsize) pos[n - 1], VFS495_ASM_MAX_ROWS);
   if (rows < 2)
     return NULL;
