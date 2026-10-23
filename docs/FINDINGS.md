@@ -709,3 +709,131 @@ patch; F / G / H = setup without the 2581 B patch / the 405 B patches / the 1301
 patches, but the 2691 / 3033 B configs without TLV types 23 and 27. Run 4 used `R A R E C A F G H`; run 5-6 used `R A R E R F R H R G`; after run 6 the default is `R F R H R G`. Probe
 hygiene: every step waits for a running reset instead of a fixed 3 s, plus 5 s after a re-enumeration; refusals,
 errors and rejections watch for a reset and force one if none comes (a 2b04 leaves the sensor broken).
+
+## T7 run 9: G vs H in detail, ROM-only configs, plaintext (2026-10-10) -> VFS495_PROBE_DUMP, tools/compare_probe_dumps.py
+`R G R H R G R H` with 3 swipes each and full dumps, then `R U R V R W R P`. One sensor, one finger.
+
+**The 405 B patch makes no measurable difference in this run** (contradicts run 8's G result):
+- Finger detected 6/6 in G (and 6/6 in H), after 1.1-2.4 s in both. First poll reply after arming is
+  `00000053094000` or `000000d3094000` in both G and H (not tied to the patch).
+- Calibration reads after the plaintext configs (2711-2666 B): G-vs-H byte differences are exactly as large
+  as G-vs-G and H-vs-H (e.g. 2503 B config: mean |diff| 6.3 in every pair). Run-to-run noise, no offset.
+- The 2402 B reply after the 2691 B / arming configs: 9-10 bytes vary between runs (offsets 1410-1412,
+  1980-2134), as much within a variant as between. One byte separates them: **offset 1546 of the arming reply
+  is `01` in both G runs, `00` in both H runs** (2 runs each; meaning unknown).
+- The 2691 B calibration reads decrypt with the config's type-6 key: 20 `01fe` frames, column means equal in G
+  and H. (The 288 B read after the 2331 B config decrypts to no `01fe` frames.)
+- Swipes, per-column: baseline 133.2 vs 133.2 (column correlation 0.99), contrast 40.7 vs 41.2, noise 5.5 vs 5.4,
+  ridge energy 19.6 vs 19.7.
+- NBIS (prints assembled from the dumps with tools/vfs495_assemble.py, vfs495-match):
+
+  | pairs | mean | >= 40 |
+  |-------|------|-------|
+  | H vs H (6 prints) | 55.6 | 16/30 |
+  | G vs H            | 54.9 | 44/72 |
+  | G vs G (6 prints) | 48.1 | 14/30 |
+
+  G vs G a bit lower, within what 6 prints can show. Run 8's 0/6 and "~half the swipes undetected" were most
+  likely swipe variance in rushed 15 s windows. Needs the driver measurement (10+ swipes) before the 405 B
+  patch is dropped.
+
+**ROM-only configs (no 2581 B patch):**
+- U (2666 B config without 19/20/29/7, 2691 / 3033 B without 23/27): the stripped 2666 B config (2572 B) is
+  accepted but returns no data, `12` and `1a` pass, then the next patch upload fails (as in F). Same for W.
+  So the 2666 B config breaks the data path without the 2581 B patch, with or without its unknown types.
+- **V (U without the 2666 B config): capture works.** All configs accepted, finger detected, 3206 lines, a
+  200x300 print; baseline / contrast / noise like H; NBIS vs G/H prints 14/24 pairs >= 40, mean 53 (1 print).
+- Without types 23/27 the 2691 B / arming configs return no 2402 B reply (`0000` only): that reply belongs to
+  23/27.
+
+**Bare ROM, plaintext (P):** no patches, no session: the first plaintext `02` (2331 B) is refused with `0404`,
+like plaintext commands on a patched sensor. No plaintext capture path.
+
+Next: step M (only the init patches 693 + 1301 B; setup without any patch, without the 2666 B config, 23/27
+stripped) combines G and V. If it captures as well, the driver could do the same with a reduced setup.bin;
+measure that with the driver (hw_test.sh capture + vfs495-match, 10+ swipes) before changing anything.
+
+## T7 run 10: step M, no setup patches at all (2026-10-10)
+The run was `R M R H R M R H R M R H R M R V` (4 x M, 3 x H, 1 x V), 3 swipes each, dumps. **M = init patches only
+(693 + 1301 B); setup without any 06 / 1a, without the 2666 B config, 2691 / 3033 B configs without types 23/27.**
+- **M captures.** Every config accepted, every swipe detected and streamed (9/9 with the user swiping), 200x300
+  prints. The runs without a finger (one M, one H, and an H stopped after 4 polls) were unattended starts:
+  the user didn't swipe. In the attended run (R M R H R M R V) all 12 prompts were detected in 0.9-5.0 s.
+- Ridge energy M 15.7 vs H 15.6 (same session); baseline / noise equal.
+- **Types 23/27 cause the first poll reply** `00000053094000` / `000000d3094000`: M and V (without 23/27) always start
+  at `00000000000000`; G and H (with them) always start with one of the two. Plus the 2402 B reply (run 9).
+- NBIS over runs 9-10 (prints assembled from the dumps; vfs495-match; libfprint's virtual-device overheat
+  guard stops a run after ~460 comparisons, so it was scored in batches):
+
+  | pairs | mean | >= 40 |
+  |-------|------|-------|
+  | H vs H (9 prints) | 54.4 | 43/72 (60 %) |
+  | G vs H            | 57.2 | 69/108 (64 %) |
+  | G vs M            | 51.4 | 56 % |
+  | H vs M            | 49.9 | 87/162 (54 %) |
+  | V vs V (4 prints) | 49.9 | 50 % |
+  | G vs G (6 prints) | 48.1 | 47 % |
+  | M vs M (9 prints) | 44.5 | 47 % |
+
+  M matches H prints (cross-scores ~50), so it's the same image. Its self-scores are ~10 lower than H's. That's
+  a possible small quality cost of dropping 23/27 / the 2666 B config / the 405 B patch, or just swipe variance
+  (G vs G is as low). Probe swipes can't settle it; the driver measurement (10+ swipes each) can.
+
+**Candidate minimum: the two init patches (693 + 1301 B), no setup patches.** That leaves 2 of the 4 HP patches
+(~2 KB instead of ~5 KB) and drops the 2581 B and 405 B patches from setup.bin. To test it with the driver: the
+driver writes the image key at the fixed offsets 2927 / 2959 (`VFS495_ARM_KEY_OFF`). That's wrong for a stripped
+arming config (3013 B); it must find the type-6 block instead (as probe_patches.set_key6 does).
+Done: the setup parser locates it (`vfs495_config_key_offset`, 2907 in the minimal file), and
+`make_setup_bin.py --minimal` / `VFS495_SETUP_MINIMAL=1 driver/tests/hw_test.sh` build the reduced setup.bin.
+
+## T7 run 11: the minimal setup.bin with the driver (2026-10-10)
+`driver/tests/hw_test.sh capture 10` with the full setup.bin, then with `VFS495_SETUP_MINIMAL=1` (13 setup
+commands, only the 693 + 1301 B init patches), back to back, same finger. Scored together with vfs495-match:
+
+| pairs | mean | >= 40 |
+|-------|------|-------|
+| full vs full (10 prints)    | 54.6 | 61/90 (68 %) |
+| minimal vs minimal (10)     | 60.6 | 64/90 (71 %) |
+| full vs minimal             | 56.2 | 118/200 (59 %) |
+
+- **The driver captures with the minimal setup: 10/10 prints, and it scores as well as the full one.** The
+  probe's lower M-vs-M (run 10) was swipe variance.
+- One bad swipe per set: full 07 matches nothing (mean 12.6, 0/19); without it full vs full is 64.5, 61/72.
+  Minimal 09 is weak (28.0, 2/19). They pull the cross score down.
+- Lower than phase 6 (71.7), in both sets alike: a different day / swipes, not the setup.
+
+**Result (one sensor): the sensor works with HP's two init patches alone** (693 B bootstrap + 1301 B session).
+The 405 B and 2581 B setup patches, HP's 1301 B reload, the 2666 B config and TLV types 23/27 aren't needed for
+capture or print quality. setup.bin then holds 2 of the 4 patches (~2 KB of HP code instead of ~5 KB) and 13
+instead of 24 setup commands per swipe. Still needs HP's binary once (the two patches are per-sensor too).
+Not yet checked: enroll / verify through fprintd over days, suspend/resume, a second sensor.
+
+## WHOLE-BINARY RE with REA/Ghidra (2026-10-23) -> docs/BINARY_RE.md
+Full pass over `validity-sensor` with REA (rea-agents 6.7.0) on a Ghidra 12.1.2 backend; every subsystem
+mapped and the interop-critical crypto re-derived and byte-verified. Organised reference:
+**docs/BINARY_RE.md**. Confirms the earlier findings and fills the gaps.
+
+New / confirmed:
+- CLI: 54-command table (`*0x86fbb8`), `main` gate + the 5-byte patch, `gMode` flag bits.
+- Transport: EP 0x01/0x81/0x82, frame `[op][payload]` LE, reply `[status:u16 LE]` (`0x04xx` = error class).
+  `0x17` is BOTH GetFingerState (pre-session) AND the SSLv3 app-data record byte (content type 23) — same
+  byte, demuxed by session state; secure gate `dev+0x76c` lets only `0x04`/`0x17` through plaintext.
+  Opcode fixups: peek=`0x07`, poke=`0x08` (0x04=Abort, 0x05=Reset); arm = the final `0x02` config.
+- Storage: the key store is an **"EAT" record image** (magic `EAT`+`0x21`/`0x22`), records
+  `{u8 type,u32 off,u32 len}`, data-id==type==slot; SSL keys = records 1/10/11/12/13; SHA-1 integrity
+  record `0x0e`; mirrored host-side at `SOFTWARE\Validity\vfs301\<serial>`.
+- At-rest crypto: embedded **AES-256 "GSK Global"** key in `scsDecryptWithGSKGlobal` (0x512620) unwraps
+  Global-sealed blobs offline; factory GSK path is a `return 6` stub. RSA verify keys = `gSSPubKeyList`
+  @0x637c80. Host-authority **private** key lives host-side (`HAPrivKey`, `SOFTWARE\Validity\sensor.exe\<serial>`).
+- Calibration (`scsFalconCal*`): sweep + knee per analog stage; `-nocal` replays stored values.
+- Matcher/template: feature extraction (orientation→FFT→phase→minutiae, 500 dpi, ≤76), minutia stride 0x12;
+  template = `'o'` + byte-reversed **TEA(32-round, key "digitalpersona98")** block + FtrCode + len
+  (`WriteFeatures`/`ReadFeatures`); match = Hough-vote → LSQ → log-likelihood → FAR (default `0x4000`).
+  Enrolled templates: `"VAL-ENRL"` container, payload `[0x02]`+the TEA template. Driver uses NBIS instead.
+- Provisioning/OTP: `makeprod` burns the SSK/secure bit into OTP irreversibly; `decomm` is a disabled stub.
+
+HP-FREE VERDICT (confirmed): a factory-provisioned sensor (every HP laptop) runs fully HP-free at runtime
+(replay captured patches + read EAT keys + GSK-unwrap + SSLv3 + NBIS); the one-time captured `setup.bin`
+is the only HP-origin artifact and can't be synthesized. A blank/decommissioned sensor can't be
+re-provisioned without HP (patch-signing key + SE-gated DH auth + one-way OTP). Distribution strategy /
+libfprint-upstream survey: driver/README.md.
