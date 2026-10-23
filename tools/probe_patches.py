@@ -18,6 +18,16 @@ are the init patches, 405 B / 2581 B / 1301 B the setup ones (docs/FINDINGS.md):
   H  init as recorded, setup without the 1301 B reload                        -> is HP's reload needed?
   T  like C, but the 2691 B / 3033 B configs without TLV types 23 and 27 (MODIFIED config, see below)
                                                                                -> are those the types the ROM lacks?
+  U  init as recorded, setup without the 2581 B patch, configs without the TLV types the ROM lacks (19/20/29/7
+     in the 2666 B one, 23/27 in the 2691 / 3033 B ones; MODIFIED)            -> can a ROM-only config capture?
+  V  like U, without the 2666 B config                                        -> is that config needed at all?
+  W  like U, arming config also without type 24 (338 B)                       -> in case the ROM lacks 24 too
+  P  no patches, no session: init without 06 / 1f, every setup command in plaintext, configs stripped as in U
+                                                                               -> can the bare ROM capture?
+  M  init as recorded (693 + 1301 B), setup without ANY patch or 1a (no 405 B, no 2581 B, no 1301 B reload),
+     without the 2666 B config, configs stripped as in U (MODIFIED)           -> V and G combined: the minimum?
+Run 9 (T7): G = H within run-to-run noise (calibration reads, replies, swipe baseline/contrast/noise, NBIS);
+V captured; U / W fail after the stripped 2666 B config; P's first plaintext 02 is refused (0404).
 The default run, each step from a freshly reset sensor: where exactly F's 405 B upload fails (R F), and G's
 finger detection and print quality against H as the control (R G R H R G; use VFS495_PROBE_SWIPES=3 and
 VFS495_PROBE_TRACE, score the prints with vfs495-match). A and E (run 6) showed the 693 B patch is needed; a timed-out flash read no
@@ -46,6 +56,13 @@ Results so far (one sensor, docs/FINDINGS.md "Which HP patches does the sensor n
 - Run 6 (R A R E R F R H R G, prints decoded): without the 693 B patch on a fresh sensor, 1f05 is rejected
   (6d04), the handshake refused with 2604, and the 1301 B upload kills the sensor (E). F failed the same way
   again (both times right after a failed E); H and G (no 405 B) gave 200x300 prints.
+
+T7 (405 B patch, what it changes): VFS495_PROBE_DUMP=DIR saves everything the sensor returns per step (setup
+replies incl. extra bytes, ep 0x82 reads with the config's type-6 key, finger polls, the encrypted swipe and its
+key) as dump-<step>-<time>.json, 0600; compare G against H with tools/compare_probe_dumps.py. E.g.
+    sudo VFS495_PROBE_DUMP=/tmp/vfs-dump VFS495_PROBE_SWIPES=3 python3 probe_patches.py R G R H R G R H
+T7 (2581 B patch / bare ROM): R U R V R W, and R P (the arming key is set via the type-6 block, wherever a
+stripped config moves it).
 
 02 configs are TLV lists after a 5 B header: u16le type, u16le length, payload (type 3 = 32-bit register write,
 type 6 = image key + IV, ...). T drops whole TLVs and leaves everything else as recorded. Still RAM only.
@@ -86,7 +103,9 @@ RESET_BACK_WAIT = 20
 SETTLE = float(os.environ.get("VFS495_PROBE_SETTLE", "5"))   # 1 s after re-enumeration was too short (run 4)
 DEFAULT = "R F R G R H R G".split()
 FLASH = None                 # 4 KiB flash block of the last init that read it (the RSA key is stable per device)
-VARIANTS = "ABCDEFGHT"
+VARIANTS = "ABCDEFGHTUVWPM"
+ROM_LACKS = {2666: (19, 20, 29, 7), 2691: (23, 27), 3033: (23, 27)}   # TLV types only the 2581 B patch accepts
+DUMP = None                  # VFS495_PROBE_DUMP: everything the sensor returns in one variant run (see dump_*)
 STRIP_TYPES = (23, 27)
 
 
@@ -100,6 +119,46 @@ def tlvs(cfg):
         out.append((t, cfg[o + 4:o + 4 + n]))
         o += 4 + n
     return cfg[:5], out
+
+
+def key6(cfg):
+    """(key, iv) of a config's type-6 stream crypto block (its first 48 B), or None."""
+    for t, p in tlvs(cfg)[1]:
+        if t == 6:
+            return p[:32], p[32:48]
+    return None
+
+
+def set_key6(cfg, key, iv):
+    """The config with its type-6 block's key + IV replaced (offset 2927 / 2959 in the recorded 3033 B one)."""
+    o = 5
+    while o < len(cfg):
+        t, n = struct.unpack_from("<HH", cfg, o)
+        if t == 6:
+            return cfg[:o + 4] + key + iv + cfg[o + 4 + 48:]
+        o += 4 + n
+    raise ValueError("config has no type-6 block")
+
+
+def strip_rom_lacks(setup, extra=()):
+    """Configs without the TLV types the ROM lacks (ROM_LACKS); extra = (size, types) pairs stripped too."""
+    out = []
+    for c, r in setup:
+        if c[:1] == b"\x02":
+            types = ROM_LACKS.get(len(c), ()) + tuple(t for n, ts in extra if n == len(c) for t in ts)
+            if types:
+                c = strip_tlvs(c, types)
+        out.append((c, r))
+    return out
+
+
+class Plain:
+    """Stands in for the SSL state in step P: commands go out and come back in plaintext."""
+    def encrypt_record(self, typ, c):
+        return c
+
+    def decrypt_record(self, typ, body):
+        return body, True
 
 
 def strip_tlvs(cfg, types):
@@ -128,8 +187,11 @@ def variant_cmds(init, setup, which):
     """(init, setup) for a variant. Setup entries stay (cmd, reads)."""
     no_setup_patches = [(c, r) for c, r in setup if c[:1] not in (b"\x06", b"\x1a")]
     keep = {"A": (), "B": (693,), "C": (693, 1301), "D": (), "E": (1301,),
-            "F": (693, 1301), "G": (693, 1301), "H": (693, 1301), "T": (693, 1301)}[which]
+            "F": (693, 1301), "G": (693, 1301), "H": (693, 1301), "T": (693, 1301),
+            "U": (693, 1301), "V": (693, 1301), "W": (693, 1301), "P": (), "M": (693, 1301)}[which]
     init_v = [c for c in init if c[:1] != b"\x06" or len(c) in keep]
+    if which == "P":                  # no session, so no RSA key needed: no flash reads (rejected without 693 B)
+        init_v = [c for c in init_v if c[:1] != b"\x1f"]
     if which == "D":
         setup_v = list(setup)
     elif which == "F":
@@ -141,6 +203,15 @@ def variant_cmds(init, setup, which):
     elif which == "T":
         setup_v = [(strip_tlvs(c, STRIP_TYPES) if c[:1] == b"\x02" and len(c) in (2691, 3033) else c, r)
                    for c, r in no_setup_patches]
+    elif which in "UVW":
+        setup_v = drop_patches(setup, (2581,))
+        if which == "V":
+            setup_v = [(c, r) for c, r in setup_v if not (c[:1] == b"\x02" and len(c) == 2666)]
+        setup_v = strip_rom_lacks(setup_v, ((3033, (24,)),) if which == "W" else ())
+    elif which == "M":
+        setup_v = strip_rom_lacks([(c, r) for c, r in no_setup_patches if not (c[:1] == b"\x02" and len(c) == 2666)])
+    elif which == "P":
+        setup_v = strip_rom_lacks([(c, r) for c, r in no_setup_patches if c[:1] != b"\x1f"])
     else:
         setup_v = no_setup_patches
     return init_v, setup_v
@@ -224,8 +295,8 @@ def pcmd(dev, st, c, res):
         res["failed at"] = "%s: written, no reply after %.3f s (%s)" % (name, time.monotonic() - t0, e)
         trace("reply FAILED", name)
         raise
-    out = b""
-    for typ, body in S.split_records(raw):
+    out = raw if isinstance(st, Plain) else b""
+    for typ, body in ([] if isinstance(st, Plain) else S.split_records(raw)):
         if typ == 0x15 and len(body) % 16:            # plaintext alert: the sensor dropped the session
             res["failed at"] = "%s: plaintext alert %s" % (name, body.hex())
             raise RuntimeError("sensor alert " + body.hex())
@@ -235,6 +306,35 @@ def pcmd(dev, st, c, res):
         out += data
     trace(name, "reply %d B %s after %.3f s" % (len(out), out[:8].hex(), time.monotonic() - t0))
     return out
+
+
+class RecordingDev:
+    """Forwards to the USB device and keeps every chunk read from ep 0x82 (for the swipe dump)."""
+    def __init__(self, dev):
+        self.dev, self.chunks = dev, []
+
+    def read(self, ep, n, to):
+        r = self.dev.read(ep, n, to)
+        if ep == S.EP_DATA_IN:
+            self.chunks.append(bytes(r))
+        return r
+
+    def __getattr__(self, name):
+        return getattr(self.dev, name)
+
+
+def dump_new(which):
+    return {"variant": which, "time": int(time.time()), "setup": [], "polls": [], "swipes": []}
+
+
+def dump_save(res):
+    """Write the step's dump: JSON, bytes as hex. Raw sensor output incl. the swipe (biometric data): 0600."""
+    out = os.environ.get("VFS495_PROBE_DUMP")
+    if not out or DUMP is None:
+        return
+    path = os.path.join(out, "dump-%s-%d.json" % (DUMP["variant"], DUMP["time"]))
+    save_private(path, json.dumps(DUMP).encode())
+    res["dump"] = path
 
 
 def save_private(path, data):
@@ -308,13 +408,123 @@ def force_reset(init):
     return res
 
 
+def plain_frames(chunks):
+    """01fe frames in the stream as read, without decryption (does the sensor stream in plaintext?)."""
+    data = b"".join(chunks)
+    return sum(data[o:o + 2] == b"\x01\xfe" for o in range(0, len(data) - N.FRAME + 1, N.FRAME))
+
+
+def plain_stop(dev):
+    """stop_stream for step P: 04 in plaintext, drain, read the reply."""
+    S.send(dev, b"\x04")
+    try:
+        while True:
+            dev.read(S.EP_DATA_IN, 16384, 300)
+    except usb.core.USBError:
+        pass
+    try:
+        S.recv(dev, 0x400, 1000)
+    except usb.core.USBError:
+        pass
+
+
+def run_setup(dev, st, which, setup_v, res):
+    """GetVersion, then setup + arming + finger poll + swipe, VFS495_PROBE_SWIPES times. st: SSL state or Plain."""
+    v = pcmd(dev, st, b"\x01", res)
+    res["getversion"] = status(v) + (" patch byte %02x" % v[17] if len(v) > 17 else "")
+    swipes = int(os.environ.get("VFS495_PROBE_SWIPES", "1"))
+    images, prev = [], None
+    arm = max(i for i, (c, _) in enumerate(setup_v) if c[:1] == b"\x02")     # the last config arms the sensor
+    for k in range(swipes):
+        tag = "" if swipes == 1 else " %d" % (k + 1)
+        statuses = []
+        key, iv = secrets.token_bytes(32), secrets.token_bytes(16)   # fresh image key per swipe, like the driver
+        for i, (c, reads) in enumerate(setup_v):
+            if i == arm:                          # via the type-6 block: a stripped config moves the key (T, U..W, P)
+                c = set_key6(c, key, iv)
+            r = pcmd(dev, st, c, res)
+            data = []
+            for n in reads:
+                try:
+                    data.append(S.recv(dev, n, 3000, S.EP_DATA_IN))
+                except usb.core.USBError:
+                    data.append(b"")
+            got = [len(d) for d in data]
+            if DUMP is not None:
+                k6 = key6(c) if c[:1] == b"\x02" else None
+                DUMP["setup"].append({"swipe": k + 1, "cmd": cmd_name(c), "reply": r.hex(),
+                                      "reads": [len(d) if c[:1] == b"\x1f" else d.hex() for d in data],
+                                      "key6": k6[0].hex() if k6 else None, "iv6": k6[1].hex() if k6 else None})
+            ok = r[:2] == b"\x00\x00"
+            name = cmd_name(c)
+            extra = "+%d" % (len(r) - 2) if len(r) > 2 else ""      # e.g. a patch reply with 32 B after it
+            statuses.append("%s:%s%s%s" % (name, status(r), extra,
+                                           "" if got == reads else " reads %d/%d B" % (sum(got), sum(reads))))
+            if not ok:
+                res["setup" + tag] = " ".join(statuses)
+                res["result"] = "setup command %s rejected: %s (reply %s)" % (name, status(r), r[:16].hex())
+                res["_watch"] = True   # run 1 saw a reset after a rejection: don't start the next step into it
+                return res
+        if statuses != prev:                      # later swipes: only show the setup if it changed
+            res["setup" + tag] = " ".join(statuses)
+        prev = statuses
+        # armed (the last setup command is the arming one): look for a finger, then for image data
+        print("  [%s] armed: swipe your finger now (%d s)%s..." % (which, FINGER_WAIT, tag), flush=True)
+        t_arm = time.monotonic()
+        deadline, finger = t_arm + FINGER_WAIT, False
+        polls = collections.OrderedDict()                   # reply -> [count, first seen (s after arming)]
+        while time.monotonic() < deadline:
+            f = pcmd(dev, st, b"\x17", res)
+            if DUMP is not None:
+                DUMP["polls"].append({"swipe": k + 1, "t": round(time.monotonic() - t_arm, 3), "reply": f.hex()})
+            p = polls.setdefault(f[:8].hex(), [0, time.monotonic() - t_arm])
+            p[0] += 1
+            if len(f) > 2 and f[2] & 0x02:
+                finger = True
+                break
+            time.sleep(0.05)
+        res["polls" + tag] = ", ".join("%s x%d (from %.1f s)" % (h, n, t0) for h, (n, t0) in polls.items())
+        perm = N.descramble_table()
+        # read the stream even without a finger bit: does the sensor stream anyway?
+        rdev = RecordingDev(dev)
+        raw = N.read_swipe(rdev, key, iv, perm)             # decrypts; keeps only valid 01fe frames
+        if DUMP is not None:                               # the encrypted stream as read, + its key
+            DUMP["swipes"].append({"swipe": k + 1, "finger": finger, "key": key.hex(), "iv": iv.hex(),
+                                   "chunks": [ch.hex() for ch in rdev.chunks]})
+        if isinstance(st, Plain):
+            plain_stop(dev)
+        else:
+            N.stop_stream(dev, st)                          # 04 abort, drain, resync
+        streamed = sum(len(ch) for ch in rdev.chunks)
+        trace("swipe", "finger bit %s, %d lines" % (finger, len(raw)))
+        if len(raw) < N.MIN_LINES:
+            res["swipe" + tag] = "%d decrypted lines (%d B streamed, %d plaintext 01fe frames): %s" % (
+                len(raw), streamed, plain_frames(rdev.chunks),
+                "too few" if finger else "no finger bit" + (", but it streamed" if streamed else ""))
+            continue
+        img = N.to_image(raw, perm)
+        res["swipe" + tag] = "%d decrypted lines, image %dx%d%s" % (
+            len(raw), img.shape[1], img.shape[0], "" if finger else " (finger bit NEVER set)")
+        if img.shape[0] >= 80:
+            images.append(img)
+        out = os.environ.get("VFS495_PROBE_OUT")      # a fingerprint: keep it out of the repo, 0600
+        if out:
+            path = os.path.join(out, "probe-%s-%d-%d.pgm" % (which, int(time.time()), k + 1))
+            save_private(path, b"P5\n%d %d\n255\n" % (img.shape[1], img.shape[0]) + img.tobytes())
+            res["swipe" + tag] += " -> " + path
+    res["result"] = ("CAPTURE WORKS (%d/%d prints)" % (len(images), swipes) if images
+                     else "armed, but no print")
+    return res
+
+
 def run_variant(which, init, setup):
-    global T0
+    global T0, DUMP
     res = {"variant": which}
     init_v, setup_v = variant_cmds(init, setup, which)
     S.TRAFFIC.clear()
     TRACE.clear()
     T0 = time.monotonic()
+    DUMP = dump_new(which) if os.environ.get("VFS495_PROBE_DUMP") else None
     res["init"] = describe(init_v)
     dev = S.open_device()
     addr = dev.address
@@ -330,6 +540,8 @@ def run_variant(which, init, setup):
             res["result"] = "stale session from an earlier process (sensor resets); rerun"
             broken = True
             return res
+        if which == "P":
+            return run_setup(dev, Plain(), which, setup_v, res)
         t = S.TRAFFIC[n0:]
         vers = [bytes.fromhex(t[i + 1][1]) for i, (d, h, _) in enumerate(t[:-1]) if d == "OUT" and h == "01"]
         vers = [v for v in vers if len(v) > 17]
@@ -353,79 +565,13 @@ def run_variant(which, init, setup):
             broken = True
             return res
         res["handshake"] = "ok"
-        v = pcmd(dev, st, b"\x01", res)
-        res["getversion"] = status(v) + (" patch byte %02x" % v[17] if len(v) > 17 else "")
-        swipes = int(os.environ.get("VFS495_PROBE_SWIPES", "1"))
-        images, prev = [], None
-        for k in range(swipes):
-            tag = "" if swipes == 1 else " %d" % (k + 1)
-            statuses = []
-            key, iv = secrets.token_bytes(32), secrets.token_bytes(16)   # fresh image key per swipe, like the driver
-            for c, reads in setup_v:
-                if c[:1] == b"\x02" and len(c) == N.ARM_LEN:
-                    c = c[:N.KEY_OFF] + key + c[N.KEY_OFF + 32:N.IV_OFF] + iv + c[N.IV_OFF + 16:]
-                r = pcmd(dev, st, c, res)
-                got = []
-                for n in reads:
-                    try:
-                        got.append(len(S.recv(dev, n, 3000, S.EP_DATA_IN)))
-                    except usb.core.USBError:
-                        got.append(0)
-                ok = r[:2] == b"\x00\x00"
-                name = cmd_name(c)
-                extra = "+%d" % (len(r) - 2) if len(r) > 2 else ""      # e.g. a patch reply with 32 B after it
-                statuses.append("%s:%s%s%s" % (name, status(r), extra,
-                                               "" if got == reads else " reads %d/%d B" % (sum(got), sum(reads))))
-                if not ok:
-                    res["setup" + tag] = " ".join(statuses)
-                    res["result"] = "setup command %s rejected: %s (reply %s)" % (name, status(r), r[:16].hex())
-                    watch = True       # run 1 saw a reset after a rejection: don't start the next step into it
-                    return res
-            if statuses != prev:                      # later swipes: only show the setup if it changed
-                res["setup" + tag] = " ".join(statuses)
-            prev = statuses
-            # armed (the last setup command is the arming one): look for a finger, then for image data
-            print("  [%s] armed: swipe your finger now (%d s)%s..." % (which, FINGER_WAIT, tag), flush=True)
-            t_arm = time.monotonic()
-            deadline, finger = t_arm + FINGER_WAIT, False
-            polls = collections.OrderedDict()                   # reply -> [count, first seen (s after arming)]
-            while time.monotonic() < deadline:
-                f = pcmd(dev, st, b"\x17", res)
-                p = polls.setdefault(f[:8].hex(), [0, time.monotonic() - t_arm])
-                p[0] += 1
-                if len(f) > 2 and f[2] & 0x02:
-                    finger = True
-                    break
-                time.sleep(0.05)
-            res["polls" + tag] = ", ".join("%s x%d (from %.1f s)" % (h, n, t0) for h, (n, t0) in polls.items())
-            perm = N.descramble_table()
-            # read the stream even without a finger bit: does the sensor stream anyway?
-            raw = N.read_swipe(dev, key, iv, perm)              # decrypts; keeps only valid 01fe frames
-            N.stop_stream(dev, st)                              # 04 abort, drain, resync
-            trace("swipe", "finger bit %s, %d lines" % (finger, len(raw)))
-            if len(raw) < N.MIN_LINES:
-                res["swipe" + tag] = "%d decrypted lines: %s" % (
-                    len(raw), "too few" if finger else "no finger bit" + (", but it streamed" if len(raw) else ""))
-                continue
-            img = N.to_image(raw, perm)
-            res["swipe" + tag] = "%d decrypted lines, image %dx%d%s" % (
-                len(raw), img.shape[1], img.shape[0], "" if finger else " (finger bit NEVER set)")
-            if img.shape[0] >= 80:
-                images.append(img)
-            out = os.environ.get("VFS495_PROBE_OUT")      # a fingerprint: keep it out of the repo, 0600
-            if out:
-                path = os.path.join(out, "probe-%s-%d-%d.pgm" % (which, int(time.time()), k + 1))
-                save_private(path, b"P5\n%d %d\n255\n" % (img.shape[1], img.shape[0]) + img.tobytes())
-                res["swipe" + tag] += " -> " + path
-        res["result"] = ("CAPTURE WORKS (%d/%d prints)" % (len(images), swipes) if images
-                         else "armed, but no print")
-        return res
+        return run_setup(dev, st, which, setup_v, res)
     except (usb.core.USBError, RuntimeError) as e:
         res["result"] = "error: %s, last command sent %s" % (e, last_cmd())
         broken = True
         return res
     finally:
-        if st is not None and not broken:
+        if st is not None and not broken and not isinstance(st, Plain):
             res["close"] = "confirmed" if S.close_session(dev, st) else "NOT confirmed"
             broken = res["close"] != "confirmed"
         S.close_device(dev)
@@ -434,7 +580,8 @@ def run_variant(which, init, setup):
             path = os.path.join(out, "trace-%s-%d.json" % (which, int(time.time())))
             save_private(path, json.dumps(TRACE, indent=0).encode())
             res["trace"] = path
-        if broken or watch:
+        dump_save(res)
+        if broken or watch or res.pop("_watch", False):
             res["reset"] = wait_reset(addr, which) or "none within %d s" % RESET_GONE_WAIT
         if broken and res["reset"].startswith("none"):
             # after a 2b04 the sensor stays broken until the next access (run 4): reset it now
@@ -454,6 +601,16 @@ def plan(steps, init, setup):
                 if c[:1] == b"\x02" and any(t in STRIP_TYPES for t, _ in tlvs(c)[1]):
                     sys.exit("T: TLV strip failed")
             print("   (2691/3033 B configs without TLV types %s)" % ", ".join(map(str, STRIP_TYPES)))
+        if w in "UVWPM":
+            for c, _ in setup_v:
+                if c[:1] == b"\x02" and any(t in (7, 19, 20, 29, 23, 27) + ((24,) if w == "W" else ())
+                                              for t, _ in tlvs(c)[1]):
+                    sys.exit("%s: TLV strip failed" % w)
+            print("   (configs without the TLV types only the 2581 B patch accepts: %s%s)" % (
+                "; ".join("%d B: %s" % (n, "/".join(map(str, ts))) for n, ts in ROM_LACKS.items()),
+                "; 3033 B also 24" if w == "W" else ""))
+        if w == "P":
+            print("   (no session: every command in plaintext, no flash read, no handshake)")
 
 
 def main():
