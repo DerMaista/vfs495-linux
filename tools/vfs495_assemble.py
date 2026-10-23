@@ -130,8 +130,18 @@ def contrast_cols(img, lo=1, hi=94):
     return np.clip((img - a) / np.maximum(b - a, 1e-6), 0, 1)
 
 
-def assemble(lines):
-    """lines: (n, 264) descrambled scan lines. Returns a uint8 image (<= 300 x 200) like HP's."""
+def swipe_stats(lag, mv):
+    """Speed and length of the swipe (driver/vfs495_assemble.c swipe_stats, the TOO_FAST gate)."""
+    m = lag[mv]
+    return {"moving": int(mv.sum()),
+            "median_lag": float(np.percentile(m, 50)) if len(m) else 0.0,
+            "floor_frac": float((m <= LAGS[0] + 1).mean()) if len(m) else 0.0,
+            "rows": float(np.sum((REF_LAG / np.maximum(lag, 1.0) * mv)[:-1]))}
+
+
+def assemble(lines, stats=None):
+    """lines: (n, 264) descrambled scan lines. Returns a uint8 image (<= 300 x 200) like HP's.
+    stats (a dict, optional) receives swipe_stats()."""
     res = prep(lines)
     lo, hi = finger_span(res)
     mv = moving(res)
@@ -143,6 +153,8 @@ def assemble(lines):
         lo, hi = lo + on[0], lo + on[-1] + 1
     mv = mv[lo:hi]
     lag = lag_curve(res[lo:hi], mv=mv)
+    if stats is not None:
+        stats.update(swipe_stats(lag, mv))
     img = emit_rows(lines[lo:hi, :MAIN].astype(np.float32), lag, mv)   # raw values: keep pores/ridge shape
     img = 1 - contrast_cols(img)                            # HP's polarity is inverted vs raw
     return (img[:, ::-1] * 255).astype(np.uint8)            # and L-R mirrored
