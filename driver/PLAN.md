@@ -171,6 +171,37 @@ the driver now ends the swipe there instead of on the read timeout; the one "seq
 first 16 lines (buffered from before finger detection; dropping them changed nothing measurable).
 Remaining: fast swipes (2/10) still give short, poor prints; the assembly blocks the main loop ~1-2 s.
 
+**Phase 7 — in progress (2026-10-10).** Robustness:
+- Assembly runs in a `GTask` worker thread (~1 s per swipe); the capture loop and the main loop stay free.
+  Deactivation during assembly drops the image; finger-off still follows the image (libfprint's order).
+- Fast-swipe gate from the assembly's stats (`Vfs495AsmStats`, Python `swipe_stats`). Data: 10 normal + 5
+  deliberately fast swipes of one finger through the driver (`driver/tests/hw_test.sh capture`):
+
+  | swipes            | median lag | moving lines at lag floor | vs the 10 normal (NBIS)     |
+  |-------------------|------------|---------------------------|-----------------------------|
+  | normal (10)       | 72–106     | 1–2 %                     | mean 71.7, 73/90 pairs >= 40 |
+  | fast #15          | 25.8       | 10 %                      | mean 49.9, 12/20 >= 40       |
+  | fast #12–14       | 20–22      | 40–89 %                   | mean 3.4, max 9              |
+  | fast #11          | –          | (1331 lines, nothing moving) | –                         |
+
+  Rule: more than 25 % of the moving lines at the floor -> `FP_DEVICE_RETRY_TOO_FAST`; under 400 lines or
+  80 rows -> `TOO_SHORT`. A median-lag rule would have rejected #15, which matches. C == Python on all 15.
+- `setup.bin` missing: the open error says to run `vfs495-setup`; a warning if it is not 0600.
+- `VFS495_RAW=DIR` keeps one `swipe-NNN.npy` per swipe.
+- Hardware: 3x open/close OK (`hw_test.sh cycles 3`); enroll (5 stages) + 2/2 verify match, a fast verify
+  swipe reported `TOO_FAST` (`hw_test.sh enroll-verify`).
+
+Setup tool (closes the phase 2 gap): `runtime/vfs495-setup` (Nix: `runtime/default.nix`) runs HP's binary once
+under gdb + usblog, `runtime/dump_keyblock.py` dumps the session key block at scsSSLRsaPublicEncrypt,
+`runtime/trace_to_init.py --keyblock` decrypts HP's client records from the trace (MAC-checked) and takes the
+commands through the arming one with the ep 0x82 read sizes after each. HP logs the data endpoint as `02`
+(libusb-0.1 adds the direction bit), which the first version missed: no reads -> the sensor desynced and reset
+mid-setup. Now masked, and a trace without data reads is rejected. Offline: `tests/test_setup_trace.sh`.
+Hardware (same sensor): the 4 firmware patches byte-identical to the original recording, config 97-100 %;
+the fresh setup.bin drives the driver (3/3 swipes -> prints). HP's command count varies per run: this run had
+23 setup commands, the original 24; the extra one repeats the 2516 B calibration scan before it (HP retries
+it sometimes). Both setups work.
+
 **Notes that led to the phase 5 decision (from the offline/live assembly tests, FINDINGS 2026-10-10):**
 - `resolution` must be ~8, not ~4: the lag is measured in lines (50–170), and HP's rule is 8 lines of lag =
   1 output row (7 and 9 both scored worse).
