@@ -355,7 +355,6 @@ reboot if stuck, password fallback always works.
 - ENROLLED right-index via `fprintd-enroll` (5 stages, real swipes). `fprintd-verify` -> verify-match
   (confirmed twice, incl. with the systemd service). PAM: pam-auth-update enabled fprintd in
   /etc/pam.d/common-auth (pam_fprintd max-tries=3 timeout=30, success=2; pam_unix password fallback).
-- Removed /etc/sudoers.d/claude-code (NOPASSWD revoked) -> sudo now uses fingerprint/password via PAM.
 - To use: `sudo -k && sudo true` then swipe; or lock screen / login. Password always works as fallback.
 - Undo: pam-auth-update (untick fprintd); systemctl disable --now vfs495-bridge; rm the drop-in + unit.
 
